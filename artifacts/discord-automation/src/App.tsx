@@ -9,6 +9,7 @@ import Bots from "@/pages/bots";
 import Session from "@/pages/session";
 import Rules from "@/pages/rules";
 import Ai from "@/pages/ai";
+import Agent from "@/pages/agent";
 import NotFound from "@/pages/not-found";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ function Router() {
         <Route path="/session" component={Session} />
         <Route path="/rules" component={Rules} />
         <Route path="/ai" component={Ai} />
+        <Route path="/agent" component={Agent} />
         <Route component={NotFound} />
       </Switch>
     </MainLayout>

@@ -7,6 +7,7 @@ import {
   Activity,
   Settings,
   MessageSquare,
+  Cpu,
 } from "lucide-react";
 import React from "react";
 
@@ -17,6 +18,7 @@ const navigation = [
   { name: "Session", href: "/session", icon: Activity },
   { name: "Rules", href: "/rules", icon: Settings },
   { name: "AI Assistant", href: "/ai", icon: MessageSquare },
+  { name: "AI Agent", href: "/agent", icon: Cpu },
 ];
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
