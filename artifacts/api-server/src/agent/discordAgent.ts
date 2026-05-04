@@ -28,23 +28,48 @@ interface GeminiAction {
   y?: number;
 }
 
+interface HistoryEntry {
+  step: number;
+  action: string;
+  detail: string;
+  pageChanged: boolean;
+  url: string;
+}
+
 let activeBrowser: Browser | null = null;
-
-// Shared map: sessionId → live Page
 export const activePages = new Map<string, Page>();
-
-// Session cache: email → storage state JSON (cookies + localStorage)
 const sessionCache = new Map<string, object>();
 
 export async function getSessionScreenshot(sessionId: string): Promise<string | null> {
   const page = activePages.get(sessionId);
   if (!page) return null;
   try {
-    const buf = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false });
+    const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: false });
     return buf.toString("base64");
   } catch {
     return null;
   }
+}
+
+/**
+ * Fast page change detection using a lightweight pixel sample.
+ * Returns a simple numeric hash from a few dozen pixels.
+ */
+function quickHash(buf: Buffer): number {
+  let h = 0;
+  const step = Math.max(1, Math.floor(buf.length / 64));
+  for (let i = 0; i < buf.length; i += step) {
+    h = (h * 31 + buf[i]) >>> 0;
+  }
+  return h;
+}
+
+/**
+ * Take a fast low-quality screenshot for change detection only.
+ */
+async function fastShot(page: Page): Promise<{ buf: Buffer; hash: number }> {
+  const buf = await page.screenshot({ type: "jpeg", quality: 30, fullPage: false });
+  return { buf, hash: quickHash(buf) };
 }
 
 /** Move mouse along a bezier-curve path then click */
@@ -77,13 +102,13 @@ async function humanClick(page: Page, targetX: number, targetY: number) {
 export async function interactWithSession(
   sessionId: string,
   action:
-    | { type: "click";    x: number; y: number }
+    | { type: "click"; x: number; y: number }
     | { type: "mousedown"; x: number; y: number }
     | { type: "mousemove"; x: number; y: number }
-    | { type: "mouseup";   x: number; y: number }
-    | { type: "type";     text: string }
-    | { type: "key";      key: string }
-    | { type: "scroll";   deltaY: number }
+    | { type: "mouseup"; x: number; y: number }
+    | { type: "type"; text: string }
+    | { type: "key"; key: string }
+    | { type: "scroll"; deltaY: number }
 ): Promise<{ ok: boolean; screenshotAfter?: string }> {
   const page = activePages.get(sessionId);
   if (!page) return { ok: false };
@@ -129,7 +154,6 @@ export async function stopActiveAgent() {
   activePages.clear();
 }
 
-/** Clear cached session for an email (e.g. on login failure) */
 export function clearSessionCache(email: string) {
   sessionCache.delete(email);
 }
@@ -169,23 +193,20 @@ export async function runDiscordAgent(
   });
   activeBrowser = browser;
 
-  // Check if we have a cached session for this account
   const cachedState = sessionCache.get(task.email);
   let context: BrowserContext;
 
   if (cachedState && task.kind !== "login") {
     onEvent({ type: "log", message: "♻️ استخدام جلسة محفوظة — تخطي تسجيل الدخول", level: "success" });
     context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 800 },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       storageState: cachedState as any,
     });
   } else {
     context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 800 },
     });
   }
@@ -194,39 +215,65 @@ export async function runDiscordAgent(
   activePages.set(sessionId, page);
 
   const systemPrompt = buildSystemPrompt(task, !!cachedState && task.kind !== "login");
-  const history: string[] = [];
+  const history: HistoryEntry[] = [];
+
+  // Last screenshot hash for change detection
+  let lastHash = 0;
+  let consecutiveNoChange = 0;
 
   try {
     onEvent({ type: "log", message: "جاري الاتصال بديسكورد...", level: "info" });
 
-    const maxSteps = 50;
+    const maxSteps = 55;
     let steps = 0;
     let loginDetected = false;
 
     while (steps < maxSteps) {
       steps++;
 
-      await page.waitForTimeout(900);
+      // ── 1. Wait for page to settle (shorter than before) ─────────────────
+      await page.waitForTimeout(550);
 
-      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false });
+      // ── 2. Take main screenshot (higher quality for AI vision) ────────────
+      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
       const screenshotBase64 = screenshotBuffer.toString("base64");
+      const currentHash = quickHash(screenshotBuffer);
       onEvent({ type: "screenshot", data: screenshotBase64 });
 
-      // Auto-detect successful login and save session
       const currentUrl = page.url();
-      if (!loginDetected && (currentUrl.includes("discord.com/channels") || currentUrl.includes("discord.com/@me") || currentUrl.includes("discord.com/developers"))) {
+
+      // ── 3. Auto-save session on successful login ──────────────────────────
+      if (!loginDetected && (
+        currentUrl.includes("discord.com/channels") ||
+        currentUrl.includes("discord.com/@me") ||
+        currentUrl.includes("discord.com/developers")
+      )) {
         loginDetected = true;
         try {
           const state = await context.storageState();
           sessionCache.set(task.email, state);
-          onEvent({ type: "log", message: "✅ تم حفظ جلسة الدخول — لن تحتاج لتسجيل دخول مجدداً", level: "success" });
+          onEvent({ type: "log", message: "✅ جلسة محفوظة — لن تحتاج تسجيل دخول مجدداً", level: "success" });
         } catch {}
       }
 
-      const historyText = history.length > 0
-        ? `\nالخطوات السابقة:\n${history.slice(-10).join("\n")}`
+      // ── 4. Build rich history context ─────────────────────────────────────
+      const pageChangedFromLast = lastHash !== 0 && currentHash !== lastHash;
+      lastHash = currentHash;
+
+      // Build history summary for AI (last 8 steps)
+      const historyLines = history.slice(-8).map((h) =>
+        `خطوة ${h.step}: [${h.action}] ${h.detail} — ${h.pageChanged ? "✓ الصفحة تغيرت" : "✗ لا تغيير في الصفحة"} | URL: ${h.url}`
+      );
+      const historyText = historyLines.length > 0
+        ? `\nسجل الخطوات (آخر ${historyLines.length}):\n${historyLines.join("\n")}`
         : "";
 
+      // Warn AI if nothing changed for 2+ steps
+      const stuckWarning = consecutiveNoChange >= 2
+        ? `\n⚠️ تحذير: آخر ${consecutiveNoChange} خطوات لم تغير الصفحة. جرّب طريقة مختلفة تماماً (selector مختلف أو إحداثيات أو js_click).`
+        : "";
+
+      // ── 5. Ask AI for next action ─────────────────────────────────────────
       let response;
       try {
         response = await ai.models.generateContent({
@@ -236,20 +283,25 @@ export async function runDiscordAgent(
               role: "user",
               parts: [
                 {
-                  inlineData: {
-                    mimeType: "image/jpeg",
-                    data: screenshotBase64,
-                  },
+                  inlineData: { mimeType: "image/jpeg", data: screenshotBase64 },
                 },
                 {
-                  text: `الرابط الحالي: ${currentUrl}\n${historyText}\n\nالمهمة: ${JSON.stringify(task)}\n\nانظر للسكرين شوت بدقة شديدة وقرر الخطوة القادمة. أجب بـ JSON فقط.`,
+                  text: [
+                    `الرابط الحالي: ${currentUrl}`,
+                    `الخطوة: ${steps}/${maxSteps}`,
+                    historyText,
+                    stuckWarning,
+                    `\nالمهمة: ${JSON.stringify(task)}`,
+                    `\nانظر للسكرين شوت بعناية فائقة. هذه الصورة حديثة وتعكس الحالة الفعلية الآن.`,
+                    `قرر الخطوة التالية وأجب بـ JSON فقط.`,
+                  ].join("\n"),
                 },
               ],
             },
           ],
           config: {
             systemInstruction: systemPrompt,
-            maxOutputTokens: 1024,
+            maxOutputTokens: 512,
             responseMimeType: "application/json",
           },
         });
@@ -268,42 +320,65 @@ export async function runDiscordAgent(
         continue;
       }
 
-      onEvent({
-        type: "action",
-        action: parsed.action,
-        detail: parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message,
-      });
+      const actionDetail = parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message ?? "";
+      onEvent({ type: "action", action: parsed.action, detail: actionDetail });
 
-      history.push(
-        `خطوة ${steps}: ${parsed.action} — ${parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message ?? ""}`
-      );
-
+      // ── 6. Handle terminal actions ────────────────────────────────────────
       if (parsed.action === "done") {
         const msg = parsed.done_message ?? "اكتملت المهمة بنجاح!";
-        // If login failed, clear the cached session
-        if (parsed.success === false) {
-          sessionCache.delete(task.email);
-        }
+        if (parsed.success === false) sessionCache.delete(task.email);
         onEvent({ type: "log", message: msg, level: parsed.success !== false ? "success" : "error" });
         onEvent({ type: "done", success: parsed.success !== false, message: msg });
         break;
       }
 
       if (parsed.action === "captcha") {
-        onEvent({ type: "log", message: "تم اكتشاف كابتشا — تدخّل وحلّها ثم اضغط متابعة", level: "warn" });
+        onEvent({ type: "log", message: "كابتشا مطلوبة — تدخّل وحلّها ثم اضغط متابعة", level: "warn" });
         onEvent({ type: "captcha", message: parsed.message ?? "حل الكابتشا ثم اضغط متابعة" });
         await captchaResolver();
         onEvent({ type: "captcha_solved" });
         onEvent({ type: "log", message: "تم — استمرار التنفيذ...", level: "info" });
+        lastHash = 0; // reset change detection after captcha
+        consecutiveNoChange = 0;
         continue;
       }
+
+      // ── 7. Execute action + measure page change ───────────────────────────
+      const preActionShot = await fastShot(page);
 
       try {
         await executeAction(page, parsed, onEvent);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        onEvent({ type: "log", message: `تعذّر تنفيذ الإجراء: ${msg.slice(0, 100)}`, level: "warn" });
+        onEvent({ type: "log", message: `تعذّر التنفيذ: ${msg.slice(0, 100)}`, level: "warn" });
       }
+
+      // Wait briefly and check if page changed
+      await page.waitForTimeout(380);
+      const postActionShot = await fastShot(page);
+      const pageChanged = preActionShot.hash !== postActionShot.hash;
+
+      if (pageChanged) {
+        consecutiveNoChange = 0;
+        // Send the fresh post-action screenshot to UI immediately
+        const freshBuf = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
+        onEvent({ type: "screenshot", data: freshBuf.toString("base64") });
+        lastHash = quickHash(freshBuf);
+      } else {
+        consecutiveNoChange++;
+        if (consecutiveNoChange >= 2) {
+          onEvent({ type: "log", message: `⚠️ لا تغيير بعد ${consecutiveNoChange} خطوات — الـ AI سيجرب طريقة مختلفة`, level: "warn" });
+        }
+      }
+
+      // Record history
+      history.push({
+        step: steps,
+        action: parsed.action,
+        detail: actionDetail,
+        pageChanged,
+        url: currentUrl,
+      });
     }
 
     if (steps >= maxSteps) {
@@ -321,81 +396,47 @@ export async function runDiscordAgent(
   }
 }
 
-/**
- * Smart click with multiple fallback strategies:
- * 1. Normal Playwright click
- * 2. Force click (bypass visibility checks)
- * 3. JavaScript click via evaluate
- * 4. Coordinate-based click (if x,y provided)
- */
+// ── Smart click with 5-strategy fallback ─────────────────────────────────────
 async function smartClick(page: Page, selector: string, x?: number, y?: number): Promise<void> {
-  // Strategy 1: Normal click
+  // 1. Normal click
+  try { await page.click(selector, { timeout: 4000 }); return; } catch {}
+  // 2. First locator
+  try { await page.locator(selector).first().click({ timeout: 4000 }); return; } catch {}
+  // 3. Force click
+  try { await page.locator(selector).first().click({ force: true, timeout: 4000 }); return; } catch {}
+  // 4. JS click
   try {
-    await page.click(selector, { timeout: 5000 });
-    return;
-  } catch {}
-
-  // Strategy 2: Try first matching locator
-  try {
-    await page.locator(selector).first().click({ timeout: 5000 });
-    return;
-  } catch {}
-
-  // Strategy 3: Force click (bypass visibility/pointer-events checks)
-  try {
-    await page.locator(selector).first().click({ force: true, timeout: 5000 });
-    return;
-  } catch {}
-
-  // Strategy 4: JavaScript click via evaluate
-  try {
-    await page.evaluate((sel) => {
-      const el = document.querySelector(sel) as HTMLElement;
+    const clicked = await page.evaluate((sel) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
       if (el) { el.click(); return true; }
       return false;
     }, selector);
-    await page.waitForTimeout(300);
-    return;
+    if (clicked) { await page.waitForTimeout(200); return; }
   } catch {}
-
-  // Strategy 5: Coordinate-based click if AI provided coordinates
+  // 5. Coordinate-based
   if (x !== undefined && y !== undefined) {
-    await humanClick(page, x, y);
-    return;
+    await humanClick(page, x, y); return;
   }
-
   throw new Error(`لم يُعثر على العنصر: ${selector}`);
 }
 
-/**
- * Smart type with fallback strategies
- */
+// ── Smart type with fallback ──────────────────────────────────────────────────
 async function smartType(page: Page, selector: string, text: string): Promise<void> {
-  // Strategy 1: Click then fill
+  // 1. Click + fill
   try {
-    await page.click(selector, { timeout: 5000 });
-    await page.fill(selector, text, { timeout: 5000 });
+    await page.click(selector, { timeout: 4000 });
+    await page.fill(selector, text, { timeout: 4000 });
     return;
   } catch {}
-
-  // Strategy 2: Locator fill
-  try {
-    const loc = page.locator(selector).first();
-    await loc.fill(text, { timeout: 5000 });
-    return;
-  } catch {}
-
-  // Strategy 3: Focus + clear + type
+  // 2. Locator fill
+  try { await page.locator(selector).first().fill(text, { timeout: 4000 }); return; } catch {}
+  // 3. Focus + keyboard
   try {
     await page.focus(selector);
-    await page.evaluate((sel) => {
-      const el = document.querySelector(sel) as HTMLInputElement;
-      if (el) el.value = "";
-    }, selector);
+    await page.evaluate((sel) => { const el = document.querySelector(sel) as HTMLInputElement | null; if (el) el.value = ""; }, selector);
     await page.keyboard.type(text, { delay: 40 });
     return;
   } catch {}
-
   throw new Error(`لم يُعثر على حقل الإدخال: ${selector}`);
 }
 
@@ -405,39 +446,33 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
       if (action.url) {
         onEvent({ type: "log", message: `فتح: ${action.url}`, level: "info" });
         await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(1500);
+        // Extra settle time for navigation
+        await page.waitForTimeout(1200);
       }
       break;
 
     case "click":
       if (action.selector) {
-        onEvent({ type: "log", message: `نقر على: ${action.selector}`, level: "info" });
+        onEvent({ type: "log", message: `نقر: ${action.selector}`, level: "info" });
         await smartClick(page, action.selector, action.x, action.y);
       } else if (action.x !== undefined && action.y !== undefined) {
-        onEvent({ type: "log", message: `نقر على إحداثيات: (${action.x}, ${action.y})`, level: "info" });
+        onEvent({ type: "log", message: `نقر إحداثيات: (${action.x}, ${action.y})`, level: "info" });
         await humanClick(page, action.x, action.y);
       }
       break;
 
     case "js_click":
-      // Direct JavaScript click — for elements that resist normal clicking (checkboxes, hidden elements)
       if (action.selector) {
         onEvent({ type: "log", message: `JS نقر: ${action.selector}`, level: "info" });
         const clicked = await page.evaluate((sel) => {
-          const el = document.querySelector(sel) as HTMLElement;
+          const el = document.querySelector(sel) as HTMLElement | null;
           if (el) { el.click(); return true; }
-          // Try by text content
-          const all = document.querySelectorAll("*");
-          for (const node of all) {
-            if (node.textContent?.trim() === sel) {
-              (node as HTMLElement).click();
-              return true;
-            }
-          }
           return false;
         }, action.selector);
-        if (!clicked) {
-          onEvent({ type: "log", message: `JS click: عنصر غير موجود، تخطي`, level: "warn" });
+        if (!clicked && action.x !== undefined && action.y !== undefined) {
+          await humanClick(page, action.x, action.y);
+        } else if (!clicked) {
+          onEvent({ type: "log", message: `js_click: العنصر غير موجود، تخطي`, level: "warn" });
         }
       } else if (action.x !== undefined && action.y !== undefined) {
         await humanClick(page, action.x, action.y);
@@ -464,127 +499,112 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
 
     case "hover":
       if (action.selector) {
-        try {
-          await page.hover(action.selector, { timeout: 5000 });
-        } catch {
-          onEvent({ type: "log", message: `hover: تخطي (غير مرئي)`, level: "warn" });
-        }
+        try { await page.hover(action.selector, { timeout: 4000 }); }
+        catch { onEvent({ type: "log", message: `hover: تخطي`, level: "warn" }); }
       }
       break;
 
     case "wait":
       onEvent({ type: "log", message: "انتظار...", level: "info" });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1800);
       break;
   }
 }
 
+// ── System prompt builder ─────────────────────────────────────────────────────
 function buildSystemPrompt(task: AgentTask, hasSession: boolean): string {
-  const base = `أنت مساعد أتمتة ديسكورد. تتحكم بمتصفح لإنجاز مهام على ديسكورد وDiscord Developer Portal.
-تحصل على سكرين شوت للمتصفح وتقرر الخطوة القادمة.
+  const base = `أنت مساعد أتمتة ديسكورد محترف. تتحكم بمتصفح حقيقي لإنجاز مهام على ديسكورد وDiscord Developer Portal.
 
-أجب دائماً بـ JSON فقط بهذا الشكل:
+السكرين شوت المُرسل إليك حديث جداً ويعكس الحالة الفعلية للمتصفح الآن. لا تفترض أي شيء خارج ما تراه.
+
+أجب بـ JSON فقط:
 {
   "action": "navigate"|"click"|"type"|"wait"|"done"|"captcha"|"scroll"|"press_key"|"hover"|"js_click",
   "selector": "CSS selector",
-  "text": "النص للكتابة",
+  "text": "النص",
   "url": "الرابط",
-  "key": "اسم المفتاح",
-  "x": رقم_اختياري_إحداثية_X,
-  "y": رقم_اختياري_إحداثية_Y,
-  "message": "رسالة للمستخدم",
-  "done_message": "رسالة الإتمام",
+  "key": "المفتاح",
+  "x": رقم_اختياري,
+  "y": رقم_اختياري,
+  "message": "رسالة",
+  "done_message": "رسالة النهاية",
   "success": true|false
 }
 
-قواعد الـ selectors - مهمة جداً:
-- انظر للسكرين شوت بدقة قبل اختيار الـ selector
-- استخدم selectors بسيطة وموثوقة:
-  * للأزرار: button[type="submit"] أو text="اسم الزر" أو role=button[name="نص"]
-  * للـ inputs: input[type="email"] أو input[name="email"] أو input[placeholder="..."]
-  * للـ checkboxes: استخدم action "js_click" مع selector "input[type=checkbox]" دائماً
-  * للروابط: a:has-text("نص") أو text="نص الرابط"
-- إذا لم تكن متأكداً من الـ selector، أضف x وy كإحداثيات احتياطية
-- لا تستخدم selectors معقدة أو متداخلة
-- إذا كان عنصر غير مرئي أو خارج الشاشة: استخدم scroll أولاً
+قواعد الـ selectors (مهمة جداً):
+• انظر للسكرين شوت قبل اختيار أي selector — فقط استخدم عناصر تراها فعلاً
+• للأزرار: button[type="submit"] أو :text("نص الزر") أو role=button[name="نص"]
+• للـ inputs: input[type="email"] أو input[name="email"]
+• للـ checkboxes: استخدم action "js_click" دائماً مع input[type=checkbox]
+• أضف x,y من موقع العنصر في الصورة كـ احتياطي دائماً
 
 قواعد عامة:
-- CAPTCHA/hCaptcha/reCAPTCHA → أرجع action:"captcha" فوراً
-- تحقق بريد إلكتروني → أرجع action:"captcha" مع شرح المطلوب
-- عند اكتمال المهمة → action:"done" مع success:true
-- عند فشل مؤكد → action:"done" مع success:false
-- خطوة واحدة في كل رد فقط
-- إذا رأيت نفس الصفحة مرتين متتاليتين بدون تغيير → جرب طريقة مختلفة أو استخدم إحداثيات`;
+• إذا كان السجل يقول "لا تغيير" لنفس الخطوة — جرّب selector مختلف أو إحداثيات أو js_click
+• CAPTCHA/hCaptcha → action:"captcha" فوراً
+• تحقق بريد إلكتروني → action:"captcha" مع شرح
+• عند الإتمام → done:true | عند فشل مؤكد → done:false
+• خطوة واحدة فقط في كل رد
+• لا تكرر نفس الـ action بنفس الـ selector إذا فشل مرتين`;
 
   if (task.kind === "login") {
     return `${base}
 
-المهمة: تسجيل الدخول إلى حساب ديسكورد
-الإيميل: ${task.email}
+المهمة: تسجيل الدخول إلى ديسكورد
+البريد: ${task.email}
 الباسوورد: ${task.password}
-${task.twofaSecret ? `2FA Secret: ${task.twofaSecret}` : "لا يوجد 2FA"}
+${task.twofaSecret ? `2FA: ${task.twofaSecret}` : "لا يوجد 2FA"}
 
-الخطوات المحددة:
-1. navigate إلى https://discord.com/login
-2. type في input[name="email"] أو input[type="email"] ← الإيميل
-3. type في input[name="password"] أو input[type="password"] ← الباسوورد
-4. click على button[type="submit"] أو الزر الأزرق "Log In"
-5. انتظر تحميل الصفحة
-6. إذا طُلب 2FA → أدخل رمز TOTP من السر (احسبه من السر)
-7. إذا طُلب تحقق بريد أو كابتشا → action:"captcha"
-8. عند الوصول للصفحة الرئيسية → done بنجاح`;
+الخطوات:
+1. navigate → https://discord.com/login
+2. type → input[name="email"] ← البريد الإلكتروني
+3. type → input[name="password"] ← الباسوورد
+4. click → button[type="submit"] أو الزر الأزرق
+5. إذا 2FA → أدخل رمز TOTP
+6. إذا كابتشا/تحقق بريد → captcha
+7. عند الوصول للرئيسية → done:true`;
   }
 
   if (task.kind === "create_bot") {
-    const loginSteps = hasSession
-      ? `1. navigate مباشرةً إلى https://discord.com/developers/applications (الجلسة محفوظة — لا تسجل دخول)`
-      : `1. navigate إلى https://discord.com/login وسجل دخول بـ ${task.email}
-2. navigate إلى https://discord.com/developers/applications`;
+    const step1 = hasSession
+      ? `1. navigate مباشرةً → https://discord.com/developers/applications`
+      : `1. navigate → https://discord.com/login ثم سجّل دخول بـ ${task.email}
+2. navigate → https://discord.com/developers/applications`;
 
     return `${base}
 
-المهمة: إنشاء تطبيق بوت في Discord Developer Portal
-البوت: ${task.botName} | البادئة: ${task.prefix}
-الإيميل: ${task.email}
-${hasSession ? "⚡ الجلسة محفوظة — تخطى تسجيل الدخول مباشرةً" : ""}
+المهمة: إنشاء بوت في Discord Developer Portal
+اسم البوت: ${task.botName} | البادئة: ${task.prefix}
+${hasSession ? "⚡ جلسة محفوظة — تخطى تسجيل الدخول" : `البريد: ${task.email}`}
 
-الخطوات المحددة:
-${loginSteps}
-- اضغط زر "New Application" (الزر الأزرق في أعلى اليمين)
-- في حقل Name اكتب: ${task.botName}
-- للـ Checkbox في نموذج الإنشاء: استخدم action "js_click" مع selector "input[type=checkbox]"
-  إذا لم ينجح: استخدم إحداثيات تقريبية من السكرين شوت
-- اضغط زر "Create" لإنشاء التطبيق
-- بعد الإنشاء: اذهب لقسم "Bot" من القائمة الجانبية اليسرى
-- اضغط "Add Bot" أو "Reset Token" للحصول على التوكن
-- وافق على أي تأكيد
-- انسخ التوكن من الصفحة
-- done مع رسالة تحتوي التوكن كاملاً
-
-ملاحظة مهمة للـ checkbox في نموذج "Create a new app":
-- استخدم action: "js_click" مع selector: "input[type=checkbox]"
-- أو استخدم action: "click" مع إضافة x,y من موقع الـ checkbox في السكرين شوت`;
+الخطوات:
+${step1}
+• اضغط "New Application" (الزر الأزرق اليمين العلوي)
+• في حقل Name: اكتب "${task.botName}"
+• للـ Checkbox في نموذج الإنشاء: استخدم js_click مع selector "input[type=checkbox]"
+• اضغط "Create"
+• بعد الإنشاء: اذهب لـ "Bot" من القائمة اليسرى
+• اضغط "Add Bot" أو "Reset Token"
+• وافق على التأكيدات
+• انسخ التوكن → done:true مع التوكن في done_message`;
   }
 
   if (task.kind === "reset_token") {
-    const loginSteps = hasSession
-      ? `1. navigate مباشرةً إلى https://discord.com/developers/applications/${task.appId}/bot`
-      : `1. navigate إلى https://discord.com/login وسجل دخول
-2. navigate إلى https://discord.com/developers/applications/${task.appId}/bot`;
+    const step1 = hasSession
+      ? `1. navigate → https://discord.com/developers/applications/${task.appId}/bot`
+      : `1. navigate → https://discord.com/login ثم سجّل دخول
+2. navigate → https://discord.com/developers/applications/${task.appId}/bot`;
 
     return `${base}
 
-المهمة: إعادة تعيين توكن بوت
-معرف التطبيق: ${task.appId}
-الإيميل: ${task.email}
-${hasSession ? "⚡ الجلسة محفوظة — تخطى تسجيل الدخول" : ""}
+المهمة: إعادة تعيين توكن
+التطبيق: ${task.appId}
+${hasSession ? "⚡ جلسة محفوظة" : `البريد: ${task.email}`}
 
-الخطوات المحددة:
-${loginSteps}
-- اضغط "Reset Token"
-- وافق على أي تأكيد
-- انسخ التوكن الجديد
-- done مع التوكن في done_message`;
+الخطوات:
+${step1}
+• اضغط "Reset Token"
+• وافق على التأكيد
+• انسخ التوكن الجديد → done:true مع التوكن في done_message`;
   }
 
   return base;
