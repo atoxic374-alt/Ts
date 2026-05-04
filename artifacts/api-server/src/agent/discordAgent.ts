@@ -396,8 +396,56 @@ export async function runDiscordAgent(
   }
 }
 
+// ── Discord-specific: click the terms/agreement checkbox ─────────────────────
+// Discord Developer Portal uses a visually-hidden checkbox inside a label.
+// The real input has opacity:0; the visible element is a sibling div.
+// We must click the LABEL (or the visual div), not the input directly.
+async function clickDiscordCheckbox(page: Page): Promise<boolean> {
+  const result = await page.evaluate(() => {
+    // Strategy A: click the label wrapping the checkbox
+    const label = document.querySelector('label:has(input[type="checkbox"])') as HTMLElement | null;
+    if (label) { label.click(); return "label"; }
+
+    // Strategy B: click any visible checkbox-like div (Discord's custom UI)
+    const checkboxDiv = document.querySelector('input[type="checkbox"] + div, input[type="checkbox"] ~ div') as HTMLElement | null;
+    if (checkboxDiv) { checkboxDiv.click(); return "sibling-div"; }
+
+    // Strategy C: force-check the input via JS property + dispatch events
+    const input = document.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+    if (input) {
+      input.checked = true;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      return "input-forced";
+    }
+
+    // Strategy D: click any element containing "agree" or "terms" text nearby
+    const allEls = document.querySelectorAll('div, span, label');
+    for (const el of allEls) {
+      const txt = (el as HTMLElement).textContent?.toLowerCase() ?? "";
+      if ((txt.includes("agree") || txt.includes("terms")) && (el as HTMLElement).offsetWidth < 60) {
+        (el as HTMLElement).click();
+        return "text-match";
+      }
+    }
+
+    return null;
+  });
+
+  if (result) {
+    await page.waitForTimeout(300);
+    return true;
+  }
+  return false;
+}
+
 // ── Smart click with 5-strategy fallback ─────────────────────────────────────
 async function smartClick(page: Page, selector: string, x?: number, y?: number): Promise<void> {
+  // Special case: checkbox — use dedicated handler first
+  if (selector.includes("checkbox")) {
+    const handled = await clickDiscordCheckbox(page);
+    if (handled) return;
+  }
   // 1. Normal click
   try { await page.click(selector, { timeout: 4000 }); return; } catch {}
   // 2. First locator
@@ -464,6 +512,20 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
     case "js_click":
       if (action.selector) {
         onEvent({ type: "log", message: `JS نقر: ${action.selector}`, level: "info" });
+        // Special path for checkboxes — use dedicated multi-strategy handler
+        if (action.selector.includes("checkbox")) {
+          const handled = await clickDiscordCheckbox(page);
+          if (handled) {
+            onEvent({ type: "log", message: `✓ تم الضغط على الـ checkbox`, level: "success" });
+          } else if (action.x !== undefined && action.y !== undefined) {
+            onEvent({ type: "log", message: `checkbox: جرب الإحداثيات`, level: "warn" });
+            await humanClick(page, action.x, action.y);
+          } else {
+            onEvent({ type: "log", message: `checkbox: تعذّر — جرب الإحداثيات في الخطوة التالية`, level: "warn" });
+          }
+          break;
+        }
+        // Normal JS click for non-checkbox elements
         const clicked = await page.evaluate((sel) => {
           const el = document.querySelector(sel) as HTMLElement | null;
           if (el) { el.click(); return true; }
@@ -472,7 +534,7 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
         if (!clicked && action.x !== undefined && action.y !== undefined) {
           await humanClick(page, action.x, action.y);
         } else if (!clicked) {
-          onEvent({ type: "log", message: `js_click: العنصر غير موجود، تخطي`, level: "warn" });
+          onEvent({ type: "log", message: `js_click: العنصر غير موجود`, level: "warn" });
         }
       } else if (action.x !== undefined && action.y !== undefined) {
         await humanClick(page, action.x, action.y);
@@ -535,11 +597,18 @@ function buildSystemPrompt(task: AgentTask, hasSession: boolean): string {
 • انظر للسكرين شوت قبل اختيار أي selector — فقط استخدم عناصر تراها فعلاً
 • للأزرار: button[type="submit"] أو :text("نص الزر") أو role=button[name="نص"]
 • للـ inputs: input[type="email"] أو input[name="email"]
-• للـ checkboxes: استخدم action "js_click" دائماً مع input[type=checkbox]
-• أضف x,y من موقع العنصر في الصورة كـ احتياطي دائماً
+• للـ checkboxes: استخدم action "js_click" مع selector "input[type=checkbox]"
+  ← النظام سيجرب تلقائياً: الـ label، الـ div المجاور، وإجبار الـ input
+• أضف x,y من موقع العنصر في الصورة دائماً كاحتياطي
+
+قواعد Checkbox ديسكورد (مهم جداً):
+• Discord Developer Portal يخفي الـ checkbox بـ CSS — الشكل المرئي هو div أو svg
+• الحل الصحيح: action:"js_click" + selector:"input[type=checkbox]"
+• إذا لم يتغير شيء: حدد الـ x,y من موقع المربع في السكرين شوت واستخدم action:"click"
+• لا تستخدم page.click مع timeout طويل على الـ checkbox — سيفشل دائماً
 
 قواعد عامة:
-• إذا كان السجل يقول "لا تغيير" لنفس الخطوة — جرّب selector مختلف أو إحداثيات أو js_click
+• إذا السجل يقول "لا تغيير" مرتين — جرّب selector مختلف أو إحداثيات
 • CAPTCHA/hCaptcha → action:"captcha" فوراً
 • تحقق بريد إلكتروني → action:"captcha" مع شرح
 • عند الإتمام → done:true | عند فشل مؤكد → done:false
