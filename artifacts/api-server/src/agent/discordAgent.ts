@@ -28,14 +28,52 @@ interface GeminiAction {
 
 let activeBrowser: Browser | null = null;
 
+// Shared map: sessionId → live Page (for interactive control during pauses)
+export const activePages = new Map<string, Page>();
+
+export async function getSessionScreenshot(sessionId: string): Promise<string | null> {
+  const page = activePages.get(sessionId);
+  if (!page) return null;
+  try {
+    const buf = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false });
+    return buf.toString("base64");
+  } catch {
+    return null;
+  }
+}
+
+export async function interactWithSession(
+  sessionId: string,
+  action: { type: "click"; x: number; y: number } | { type: "type"; text: string } | { type: "key"; key: string } | { type: "scroll"; deltaY: number }
+): Promise<boolean> {
+  const page = activePages.get(sessionId);
+  if (!page) return false;
+  try {
+    if (action.type === "click") {
+      await page.mouse.click(action.x, action.y);
+    } else if (action.type === "type") {
+      await page.keyboard.type(action.text, { delay: 40 });
+    } else if (action.type === "key") {
+      await page.keyboard.press(action.key);
+    } else if (action.type === "scroll") {
+      await page.mouse.wheel(0, action.deltaY);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function stopActiveAgent() {
   if (activeBrowser) {
     await activeBrowser.close().catch(() => {});
     activeBrowser = null;
   }
+  activePages.clear();
 }
 
 export async function runDiscordAgent(
+  sessionId: string,
   task: AgentTask,
   onEvent: (event: AgentEvent) => void,
   captchaResolver: () => Promise<void>
@@ -63,7 +101,6 @@ export async function runDiscordAgent(
       "--disable-sync",
       "--disable-translate",
       "--hide-scrollbars",
-      "--metrics-recording-only",
       "--mute-audio",
       "--no-first-run",
     ],
@@ -76,6 +113,7 @@ export async function runDiscordAgent(
     viewport: { width: 1280, height: 800 },
   });
   const page = await context.newPage();
+  activePages.set(sessionId, page);
 
   const systemPrompt = buildSystemPrompt(task);
   const history: string[] = [];
@@ -83,51 +121,54 @@ export async function runDiscordAgent(
   try {
     onEvent({ type: "log", message: "جاري الاتصال بديسكورد...", level: "info" });
 
-    const maxSteps = 35;
+    const maxSteps = 40;
     let steps = 0;
 
     while (steps < maxSteps) {
       steps++;
 
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(900);
 
-      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
+      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false });
       const screenshotBase64 = screenshotBuffer.toString("base64");
-
       onEvent({ type: "screenshot", data: screenshotBase64 });
 
       const currentUrl = page.url();
-      const historyText = history.length > 0 ? `\nالخطوات السابقة:\n${history.slice(-8).join("\n")}` : "";
+      const historyText = history.length > 0
+        ? `\nالخطوات السابقة:\n${history.slice(-8).join("\n")}`
+        : "";
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: screenshotBase64,
+      let response;
+      try {
+        response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: "image/jpeg",
+                    data: screenshotBase64,
+                  },
                 },
-              },
-              {
-                text: `الرابط الحالي: ${currentUrl}
-${historyText}
-
-المهمة: ${JSON.stringify(task)}
-
-انظر للسكرين شوت وقرر الخطوة القادمة. أجب بـ JSON فقط.`,
-              },
-            ],
+                {
+                  text: `الرابط الحالي: ${currentUrl}\n${historyText}\n\nالمهمة: ${JSON.stringify(task)}\n\nانظر للسكرين شوت وقرر الخطوة القادمة. أجب بـ JSON فقط.`,
+                },
+              ],
+            },
+          ],
+          config: {
+            systemInstruction: systemPrompt,
+            maxOutputTokens: 1024,
+            responseMimeType: "application/json",
           },
-        ],
-        config: {
-          systemInstruction: systemPrompt,
-          maxOutputTokens: 1024,
-          responseMimeType: "application/json",
-        },
-      });
+        });
+      } catch (aiErr) {
+        onEvent({ type: "log", message: `خطأ Gemini: ${String(aiErr).slice(0, 80)}`, level: "warn" });
+        await page.waitForTimeout(2000);
+        continue;
+      }
 
       let parsed: GeminiAction;
       try {
@@ -144,24 +185,23 @@ ${historyText}
         detail: parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message,
       });
 
-      history.push(`الخطوة ${steps}: ${parsed.action} - ${parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message ?? ""}`);
+      history.push(
+        `خطوة ${steps}: ${parsed.action} — ${parsed.selector ?? parsed.url ?? parsed.text ?? parsed.message ?? ""}`
+      );
 
       if (parsed.action === "done") {
-        onEvent({
-          type: "log",
-          message: parsed.done_message ?? "اكتملت المهمة بنجاح!",
-          level: "success",
-        });
-        onEvent({ type: "done", success: parsed.success !== false, message: parsed.done_message ?? "تم" });
+        const msg = parsed.done_message ?? "اكتملت المهمة بنجاح!";
+        onEvent({ type: "log", message: msg, level: parsed.success !== false ? "success" : "error" });
+        onEvent({ type: "done", success: parsed.success !== false, message: msg });
         break;
       }
 
       if (parsed.action === "captcha") {
-        onEvent({ type: "log", message: "تم اكتشاف كابتشا — يرجى حلها", level: "warn" });
-        onEvent({ type: "captcha", message: parsed.message ?? "يرجى حل الكابتشا في النافذة أدناه" });
+        onEvent({ type: "log", message: "تم اكتشاف كابتشا — تدخّل وحلّها ثم اضغط متابعة", level: "warn" });
+        onEvent({ type: "captcha", message: parsed.message ?? "حل الكابتشا ثم اضغط متابعة" });
         await captchaResolver();
         onEvent({ type: "captcha_solved" });
-        onEvent({ type: "log", message: "تم حل الكابتشا، استمرار...", level: "info" });
+        onEvent({ type: "log", message: "تم — استمرار التنفيذ...", level: "info" });
         continue;
       }
 
@@ -169,7 +209,7 @@ ${historyText}
         await executeAction(page, parsed, onEvent);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        onEvent({ type: "log", message: `فشل تنفيذ الإجراء: ${msg}`, level: "warn" });
+        onEvent({ type: "log", message: `تعذّر تنفيذ الإجراء: ${msg.slice(0, 100)}`, level: "warn" });
       }
     }
 
@@ -182,6 +222,7 @@ ${historyText}
     onEvent({ type: "error", message: msg });
     onEvent({ type: "done", success: false, message: msg });
   } finally {
+    activePages.delete(sessionId);
     await browser.close().catch(() => {});
     activeBrowser = null;
   }
@@ -191,43 +232,39 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
   switch (action.action) {
     case "navigate":
       if (action.url) {
-        onEvent({ type: "log", message: `التنقل إلى: ${action.url}`, level: "info" });
+        onEvent({ type: "log", message: `فتح: ${action.url}`, level: "info" });
         await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30000 });
       }
       break;
 
     case "click":
       if (action.selector) {
-        onEvent({ type: "log", message: `النقر على: ${action.selector}`, level: "info" });
+        onEvent({ type: "log", message: `نقر على: ${action.selector}`, level: "info" });
         try {
           await page.click(action.selector, { timeout: 8000 });
         } catch {
-          const el = page.locator(action.selector).first();
-          await el.click({ timeout: 8000 });
+          await page.locator(action.selector).first().click({ timeout: 8000 });
         }
       }
       break;
 
     case "type":
       if (action.selector && action.text !== undefined) {
-        onEvent({ type: "log", message: `الكتابة في: ${action.selector}`, level: "info" });
-        try {
-          await page.click(action.selector, { timeout: 5000 });
-        } catch {}
+        onEvent({ type: "log", message: `كتابة في: ${action.selector}`, level: "info" });
+        try { await page.click(action.selector, { timeout: 5000 }); } catch {}
         await page.fill(action.selector, action.text, { timeout: 8000 });
       }
       break;
 
     case "press_key":
       if (action.key) {
-        onEvent({ type: "log", message: `ضغط مفتاح: ${action.key}`, level: "info" });
+        onEvent({ type: "log", message: `مفتاح: ${action.key}`, level: "info" });
         await page.keyboard.press(action.key);
       }
       break;
 
     case "scroll":
-      onEvent({ type: "log", message: "تمرير الصفحة...", level: "info" });
-      await page.evaluate(() => window.scrollBy(0, 400));
+      await page.mouse.wheel(0, 400);
       break;
 
     case "hover":
@@ -237,91 +274,90 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
       break;
 
     case "wait":
-      onEvent({ type: "log", message: "الانتظار قليلاً...", level: "info" });
+      onEvent({ type: "log", message: "انتظار...", level: "info" });
       await page.waitForTimeout(2000);
       break;
   }
 }
 
 function buildSystemPrompt(task: AgentTask): string {
-  const basePrompt = `أنت مساعد أتمتة ديسكورد. تتحكم بمتصفح لإنجاز مهام على ديسكورد.
-تحصل على سكرين شوت للمتصفح وعليك تقرير الخطوة القادمة.
+  const base = `أنت مساعد أتمتة ديسكورد. تتحكم بمتصفح لإنجاز مهام على ديسكورد وDiscord Developer Portal.
+تحصل على سكرين شوت للمتصفح وتقرر الخطوة القادمة.
 
 أجب دائماً بـ JSON فقط بهذا الشكل:
 {
   "action": "navigate"|"click"|"type"|"wait"|"done"|"captcha"|"scroll"|"press_key"|"hover",
-  "selector": "CSS selector أو text selector",
-  "text": "النص للكتابة (للـ type فقط)",
-  "url": "الرابط (للـ navigate فقط)",
-  "key": "اسم المفتاح (للـ press_key فقط)",
-  "message": "رسالة للمستخدم (للـ captcha أو done)",
-  "done_message": "رسالة الإتمام (للـ done فقط)",
-  "success": true|false (للـ done فقط)
+  "selector": "CSS أو text selector",
+  "text": "النص للكتابة",
+  "url": "الرابط",
+  "key": "اسم المفتاح",
+  "message": "رسالة للمستخدم",
+  "done_message": "رسالة الإتمام",
+  "success": true|false
 }
 
-قواعد مهمة:
-- للكابتشا: استخدم action: "captcha"
-- عند رؤية reCAPTCHA أو hCaptcha في السكرين شوت: أرجع action: "captcha" فوراً
-- استخدم selectors دقيقة مثل: input[name="email"], button[type="submit"], text=Login
-- للنصوص: استخدم text=النص أو :text("النص") أو role=button[name="النص"]
-- عند اكتمال المهمة: استخدم action: "done" مع success: true
-- عند فشل المهمة: استخدم action: "done" مع success: false
-- لا تتجاوز الخطوة الواحدة في كل رد
-- ديسكورد Developer Portal: https://discord.com/developers/applications`;
+قواعد:
+- رCAPTCHA/hCaptcha/reCAPTCHA في الصفحة → أرجع action:"captcha" فوراً
+- تحقق بريد إلكتروني أو رمز → أرجع action:"captcha" مع رسالة توضح المطلوب
+- استخدم selectors دقيقة: input[name="email"], button[type="submit"], text=Login
+- للنصوص استخدم: :text("نص") أو role=button[name="نص"]
+- عند اكتمال المهمة → action:"done" مع success:true
+- عند فشل → action:"done" مع success:false
+- خطوة واحدة في كل رد فقط`;
 
   if (task.kind === "login") {
-    return `${basePrompt}
+    return `${base}
 
-المهمة الحالية: تسجيل الدخول إلى حساب ديسكورد
+المهمة: تسجيل الدخول إلى حساب ديسكورد
 الإيميل: ${task.email}
 الباسوورد: ${task.password}
-${task.twofaSecret ? `رمز 2FA: استخدم TOTP من السر: ${task.twofaSecret}` : ""}
+${task.twofaSecret ? `2FA Secret: ${task.twofaSecret}` : "لا يوجد 2FA"}
 
-خطوات تسجيل الدخول:
+الخطوات:
 1. افتح https://discord.com/login
-2. ابحث عن حقل الإيميل واكتب الإيميل
-3. ابحث عن حقل الباسوورد واكتب الباسوورد
-4. انقر زر Log In
-5. إذا ظهر 2FA اكتب رمز TOTP
-6. إذا ظهرت كابتشا أرجع captcha
-7. عند الوصول لصفحة ديسكورد الرئيسية: done بنجاح`;
+2. أدخل الإيميل في حقل email
+3. أدخل الباسوورد في حقل password
+4. اضغط زر Log In
+5. إذا طُلب 2FA: أدخل رمز TOTP من السر أعلاه
+6. إذا طُلب تحقق بريد أو كابتشا → action:"captcha" مع شرح المطلوب
+7. عند الوصول للصفحة الرئيسية لديسكورد → done بنجاح`;
   }
 
   if (task.kind === "create_bot") {
-    return `${basePrompt}
+    return `${base}
 
-المهمة الحالية: إنشاء تطبيق بوت جديد على ديسكورد Developer Portal
-اسم البوت: ${task.botName}
-البادئة: ${task.prefix}
+المهمة: إنشاء تطبيق بوت في Discord Developer Portal
+البوت: ${task.botName} | البادئة: ${task.prefix}
 الإيميل: ${task.email}
 
-خطوات إنشاء البوت:
+الخطوات:
 1. افتح https://discord.com/login وسجل دخول بـ ${task.email}
-2. بعد الدخول افتح https://discord.com/developers/applications
-3. انقر "New Application"
+2. افتح https://discord.com/developers/applications
+3. اضغط "New Application"
 4. اكتب اسم التطبيق: ${task.botName}
-5. وافق على الشروط وانقر Create
-6. افتح قسم "Bot" من القائمة الجانبية
-7. انقر "Add Bot" أو "Reset Token"
-8. انسخ التوكن (سيظهر في الصفحة)
-9. عند الحصول على التوكن: done مع رسالة تحتوي التوكن`;
+5. وافق على الشروط واضغط Create
+6. اذهب لقسم "Bot" من القائمة الجانبية
+7. اضغط "Add Bot" أو "Reset Token"
+8. وافق على أي تأكيد
+9. انسخ التوكن من الصفحة
+10. done مع رسالة تحتوي التوكن كاملاً`;
   }
 
   if (task.kind === "reset_token") {
-    return `${basePrompt}
+    return `${base}
 
-المهمة الحالية: إعادة تعيين توكن تطبيق بوت
+المهمة: إعادة تعيين توكن بوت
 معرف التطبيق: ${task.appId}
 الإيميل: ${task.email}
 
-خطوات إعادة التعيين:
+الخطوات:
 1. افتح https://discord.com/login وسجل دخول
 2. افتح https://discord.com/developers/applications/${task.appId}/bot
-3. انقر "Reset Token"
+3. اضغط "Reset Token"
 4. وافق على التأكيد
 5. انسخ التوكن الجديد
-6. done مع رسالة تحتوي التوكن الجديد`;
+6. done مع التوكن في الرسالة`;
   }
 
-  return basePrompt;
+  return base;
 }
