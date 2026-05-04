@@ -8,7 +8,9 @@ export type AgentEvent =
   | { type: "captcha_solved" }
   | { type: "action"; action: string; detail?: string }
   | { type: "done"; success: boolean; message: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "paused" }
+  | { type: "resumed" };
 
 export type AgentTask =
   | { kind: "login"; email: string; password: string; twofaSecret?: string }
@@ -39,6 +41,19 @@ interface HistoryEntry {
 let activeBrowser: Browser | null = null;
 export const activePages = new Map<string, Page>();
 const sessionCache = new Map<string, object>();
+
+// ── Pause / Resume support ────────────────────────────────────────────────────
+interface PauseState { paused: boolean; resumeResolve: (() => void) | null }
+const pauseStates = new Map<string, PauseState>();
+
+export function pauseSession(sessionId: string) {
+  pauseStates.set(sessionId, { paused: true, resumeResolve: null });
+}
+
+export function resumeSession(sessionId: string) {
+  const s = pauseStates.get(sessionId);
+  if (s) { s.paused = false; s.resumeResolve?.(); s.resumeResolve = null; }
+}
 
 export async function getSessionScreenshot(sessionId: string): Promise<string | null> {
   const page = activePages.get(sessionId);
@@ -147,6 +162,9 @@ export async function interactWithSession(
 }
 
 export async function stopActiveAgent() {
+  // Resume any paused sessions so they can exit cleanly
+  for (const [, ps] of pauseStates) { ps.paused = false; ps.resumeResolve?.(); }
+  pauseStates.clear();
   if (activeBrowser) {
     await activeBrowser.close().catch(() => {});
     activeBrowser = null;
@@ -229,9 +247,24 @@ export async function runDiscordAgent(
     let loginDetected = false;
 
     while (steps < maxSteps) {
+
+      // ── 0. Pause check ────────────────────────────────────────────────────
+      if (pauseStates.get(sessionId)?.paused) {
+        onEvent({ type: "paused" });
+        await new Promise<void>((resolve) => {
+          const ps = pauseStates.get(sessionId);
+          if (ps) ps.resumeResolve = resolve;
+          else resolve();
+        });
+        onEvent({ type: "resumed" });
+        onEvent({ type: "log", message: "▶ استؤنف التنفيذ التلقائي", level: "success" });
+        lastHash = 0;
+        consecutiveNoChange = 0;
+      }
+
       steps++;
 
-      // ── 1. Wait for page to settle (shorter than before) ─────────────────
+      // ── 1. Wait for page to settle ────────────────────────────────────────
       await page.waitForTimeout(550);
 
       // ── 2. Take main screenshot (higher quality for AI vision) ────────────
@@ -439,32 +472,76 @@ async function clickDiscordCheckbox(page: Page): Promise<boolean> {
   return false;
 }
 
-// ── Smart click with 5-strategy fallback ─────────────────────────────────────
+// ── Smart click with 6-strategy fallback ─────────────────────────────────────
 async function smartClick(page: Page, selector: string, x?: number, y?: number): Promise<void> {
   // Special case: checkbox — use dedicated handler first
   if (selector.includes("checkbox")) {
     const handled = await clickDiscordCheckbox(page);
     if (handled) return;
   }
-  // 1. Normal click
-  try { await page.click(selector, { timeout: 4000 }); return; } catch {}
-  // 2. First locator
-  try { await page.locator(selector).first().click({ timeout: 4000 }); return; } catch {}
-  // 3. Force click
-  try { await page.locator(selector).first().click({ force: true, timeout: 4000 }); return; } catch {}
-  // 4. JS click
+
+  // 0. Scroll element into view (critical for off-screen elements)
+  try {
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (el) el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+    }, selector);
+    await page.waitForTimeout(150);
+  } catch {}
+
+  // 1. Wait for visible then normal click
+  try {
+    await page.locator(selector).first().waitFor({ state: "visible", timeout: 2000 });
+    await page.locator(selector).first().click({ timeout: 3000 });
+    return;
+  } catch {}
+
+  // 2. Force click (ignores visibility/interactability checks)
+  try { await page.locator(selector).first().click({ force: true, timeout: 3000 }); return; } catch {}
+
+  // 3. JS click via MouseEvent dispatch (most reliable for hidden/custom elements)
   try {
     const clicked = await page.evaluate((sel) => {
       const el = document.querySelector(sel) as HTMLElement | null;
-      if (el) { el.click(); return true; }
-      return false;
+      if (!el) return false;
+      el.scrollIntoView({ behavior: "instant", block: "center" });
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      ["mouseover", "mouseenter", "mousemove"].forEach((evt) =>
+        el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, clientX: cx, clientY: cy }))
+      );
+      el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+      el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+      el.dispatchEvent(new MouseEvent("click",     { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+      return true;
     }, selector);
-    if (clicked) { await page.waitForTimeout(200); return; }
+    if (clicked) { await page.waitForTimeout(250); return; }
   } catch {}
-  // 5. Coordinate-based
+
+  // 4. getBoundingClientRect → page.mouse.click at actual position
+  try {
+    const coords = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      el.scrollIntoView({ behavior: "instant", block: "center" });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    }, selector);
+    if (coords && coords.x > 0 && coords.y > 0) {
+      await page.mouse.move(coords.x, coords.y);
+      await page.waitForTimeout(80);
+      await page.mouse.click(coords.x, coords.y);
+      await page.waitForTimeout(200);
+      return;
+    }
+  } catch {}
+
+  // 5. Coordinate-based human click (from AI-provided coords)
   if (x !== undefined && y !== undefined) {
     await humanClick(page, x, y); return;
   }
+
   throw new Error(`لم يُعثر على العنصر: ${selector}`);
 }
 

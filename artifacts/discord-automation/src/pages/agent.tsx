@@ -10,11 +10,12 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import {
   Bot, Play, Square, RefreshCw, AlertTriangle, CheckCircle,
   XCircle, Info, Eye, Cpu, MousePointer, Keyboard, CornerDownLeft,
+  Pause, PlayCircle, WifiOff,
 } from "lucide-react";
 
-// Browser virtual size (must match Playwright viewport)
 const BW = 1280;
 const BH = 800;
+const SESSION_KEY = "discord_agent_session";
 
 type AgentEvent =
   | { type: "session_id"; sessionId: string }
@@ -24,22 +25,41 @@ type AgentEvent =
   | { type: "captcha_solved" }
   | { type: "action"; action: string; detail?: string }
   | { type: "done"; success: boolean; message: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "paused" }
+  | { type: "resumed" };
 
 type LogEntry = { id: number; message: string; level: "info" | "warn" | "error" | "success" | "action"; time: string };
 type TaskKind = "login" | "create_bot" | "reset_token";
+type InteractMode = "none" | "captcha" | "paused";
 
 function ts() {
   const n = new Date();
   return `${n.getHours().toString().padStart(2, "0")}:${n.getMinutes().toString().padStart(2, "0")}:${n.getSeconds().toString().padStart(2, "0")}`;
 }
 
-/** Map a click on the displayed image → browser coordinates */
 function imgToBrowser(el: HTMLImageElement, clientX: number, clientY: number): { x: number; y: number } {
   const rect = el.getBoundingClientRect();
-  const relX = (clientX - rect.left) / rect.width;
-  const relY = (clientY - rect.top) / rect.height;
-  return { x: Math.round(relX * BW), y: Math.round(relY * BH) };
+  return {
+    x: Math.round(((clientX - rect.left) / rect.width) * BW),
+    y: Math.round(((clientY - rect.top) / rect.height) * BH),
+  };
+}
+
+function saveSession(sessionId: string) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, savedAt: Date.now() }));
+}
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+function getSavedSession(): string | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const { sessionId, savedAt } = JSON.parse(raw) as { sessionId: string; savedAt: number };
+    if (Date.now() - savedAt > 4 * 60 * 60 * 1000) { clearSession(); return null; } // 4h expiry
+    return sessionId;
+  } catch { return null; }
 }
 
 export default function Agent() {
@@ -56,35 +76,35 @@ export default function Agent() {
   const [agentShot, setAgentShot] = useState<string | null>(null);
   const [liveShot, setLiveShot] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [captchaOpen, setCaptchaOpen] = useState(false);
+  const [interactMode, setInteractMode] = useState<InteractMode>("none");
   const [captchaMsg, setCaptchaMsg] = useState("");
   const [typeText, setTypeText] = useState("");
-  const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "running" | "paused" | "done" | "error">("idle");
   const [finalMsg, setFinalMsg] = useState("");
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   const logsEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const captchaImgRef = useRef<HTMLImageElement>(null);   // only for the captcha dialog
+  const interactImgRef = useRef<HTMLImageElement>(null);
   const logId = useRef(0);
-  const lastMoveRef = useRef(0);               // throttle mousemove sends
+  const lastMoveRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
 
-  // Keep ref in sync so pointer handlers can read it without stale closure
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
-
   useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
 
-  // Poll screenshot every 400ms while captcha is open
+  // Poll screenshot when in interact mode (captcha or paused)
   useEffect(() => {
-    if (captchaOpen && sessionId) {
+    const sid = sessionId;
+    if (interactMode !== "none" && sid) {
       const poll = async () => {
         try {
-          const r = await fetch(`/api/agent/screenshot/${sessionId}`);
+          const r = await fetch(`/api/agent/screenshot/${sid}`);
           if (r.ok) { const d = await r.json() as { screenshot: string }; setLiveShot(d.screenshot); }
         } catch {}
       };
@@ -94,14 +114,78 @@ export default function Agent() {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     }
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [captchaOpen, sessionId]);
+  }, [interactMode, sessionId]);
+
+  // ── On mount: check for saved session and reconnect ───────────────────────
+  useEffect(() => {
+    const saved = getSavedSession();
+    if (!saved) return;
+    (async () => {
+      try {
+        setReconnecting(true);
+        const r = await fetch(`/api/agent/status/${saved}`);
+        if (!r.ok) { clearSession(); setReconnecting(false); return; }
+        const data = await r.json() as {
+          exists: boolean; status: string; lastScreenshot: string | null;
+        };
+        if (!data.exists || (data.status !== "running" && data.status !== "paused")) {
+          clearSession(); setReconnecting(false); return;
+        }
+        // Reconnect!
+        addLog("🔄 إعادة ربط بالجلسة النشطة...", "info");
+        setSessionId(saved);
+        sessionIdRef.current = saved;
+        setRunning(true);
+        if (data.status === "paused") setStatus("paused");
+        else setStatus("running");
+        if (data.lastScreenshot) setAgentShot(data.lastScreenshot);
+        subscribeToSession(saved);
+      } catch {
+        clearSession();
+      } finally {
+        setReconnecting(false);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const addLog = useCallback((message: string, level: LogEntry["level"]) => {
     logId.current += 1;
-    setLogs((p) => [...p.slice(-299), { id: logId.current, message, level, time: ts() }]);
+    setLogs((p) => [...p.slice(-499), { id: logId.current, message, level, time: ts() }]);
   }, []);
 
-  // Core send — returns screenshot embedded in the response
+  // Subscribe to SSE stream (for reconnect)
+  const subscribeToSession = useCallback((sid: string) => {
+    const abort = new AbortController();
+    abortRef.current = abort;
+    (async () => {
+      try {
+        const res = await fetch(`/api/agent/reconnect/${sid}`, { signal: abort.signal });
+        if (!res.body) return;
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop() ?? "";
+          for (const part of parts) {
+            const line = part.trim();
+            if (!line.startsWith("data:")) continue;
+            try { handleEvent(JSON.parse(line.slice(5).trim()) as AgentEvent); } catch {}
+          }
+        }
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") addLog("انقطع الاتصال", "error");
+      } finally {
+        setRunning(false);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addLog]);
+
   const send = useCallback(async (action: object, silent = false): Promise<string | null> => {
     const sid = sessionIdRef.current;
     if (!sid) return null;
@@ -118,11 +202,10 @@ export default function Agent() {
     } catch { return null; }
   }, []);
 
-  // ── Pointer events for the captcha image (click + drag) ──────────────────
-
+  // ── Pointer handlers for the interactive browser image ───────────────────
   const handlePointerDown = useCallback(async (e: React.PointerEvent<HTMLImageElement>) => {
-    if (!captchaImgRef.current) return;
-    e.currentTarget.setPointerCapture(e.pointerId);  // keep events even if cursor leaves img
+    if (!interactImgRef.current) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
     const { x, y } = imgToBrowser(e.currentTarget, e.clientX, e.clientY);
     setIsDragging(false);
     setDragStart({ x, y });
@@ -132,55 +215,37 @@ export default function Agent() {
   }, [send]);
 
   const handlePointerMove = useCallback(async (e: React.PointerEvent<HTMLImageElement>) => {
-    if (!captchaImgRef.current) return;
+    if (!interactImgRef.current) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const lx = e.clientX - rect.left;
-    const ly = e.clientY - rect.top;
-    setCursorPos({ x: lx, y: ly });
-
-    if (e.buttons !== 1) return;   // only while pressed
-
-    // Mark as dragging if moved more than 4px from start
+    setCursorPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    if (e.buttons !== 1) return;
     const { x, y } = imgToBrowser(e.currentTarget, e.clientX, e.clientY);
-    if (dragStart && (Math.abs(x - dragStart.x) > 4 || Math.abs(y - dragStart.y) > 4)) {
-      setIsDragging(true);
-    }
-
-    // Throttle mousemove to ~30fps max to avoid flooding
+    if (dragStart && (Math.abs(x - dragStart.x) > 4 || Math.abs(y - dragStart.y) > 4)) setIsDragging(true);
     const now = Date.now();
     if (now - lastMoveRef.current < 33) return;
     lastMoveRef.current = now;
-    await send({ type: "mousemove", x, y }, true);  // silent — no screenshot on every move
+    await send({ type: "mousemove", x, y }, true);
   }, [send, dragStart]);
 
   const handlePointerUp = useCallback(async (e: React.PointerEvent<HTMLImageElement>) => {
-    if (!captchaImgRef.current) return;
+    if (!interactImgRef.current) return;
     const { x, y } = imgToBrowser(e.currentTarget, e.clientX, e.clientY);
-
     if (!isDragging && dragStart) {
-      // It was a click — use precise click action (not drag)
       addLog(`نقر: (${x}, ${y})`, "action");
       await send({ type: "click", x, y });
     } else if (isDragging) {
-      // End of drag
       addLog(`سحب: (${dragStart?.x ?? x},${dragStart?.y ?? y}) → (${x},${y})`, "action");
       await send({ type: "mouseup", x, y });
     }
-
-    setIsDragging(false);
-    setDragStart(null);
-    setBusy(false);
+    setIsDragging(false); setDragStart(null); setBusy(false);
   }, [send, isDragging, dragStart, addLog]);
 
   const handlePointerLeave = useCallback(async (e: React.PointerEvent<HTMLImageElement>) => {
     setCursorPos(null);
-    // If dragging and pointer leaves, release
     if (isDragging && e.buttons === 1) {
       const { x, y } = imgToBrowser(e.currentTarget, e.clientX, e.clientY);
       await send({ type: "mouseup", x, y });
-      setIsDragging(false);
-      setDragStart(null);
-      setBusy(false);
+      setIsDragging(false); setDragStart(null); setBusy(false);
     }
   }, [send, isDragging]);
 
@@ -189,8 +254,7 @@ export default function Agent() {
     addLog(`كتابة: ${typeText}`, "action");
     setBusy(true);
     await send({ type: "type", text: typeText });
-    setTypeText("");
-    setBusy(false);
+    setTypeText(""); setBusy(false);
   }, [typeText, sessionId, busy, send, addLog]);
 
   const handleKey = useCallback(async (key: string) => {
@@ -201,15 +265,61 @@ export default function Agent() {
     setBusy(false);
   }, [sessionId, busy, send, addLog]);
 
-  // ── Start agent ──────────────────────────────────────────────────────────
+  // ── handleEvent — processes both live SSE and replayed events ────────────
+  const handleEvent = useCallback((ev: AgentEvent) => {
+    switch (ev.type) {
+      case "session_id":
+        setSessionId(ev.sessionId);
+        sessionIdRef.current = ev.sessionId;
+        addLog(`جلسة: ${ev.sessionId}`, "info");
+        break;
+      case "log":          addLog(ev.message, ev.level); break;
+      case "screenshot":   setAgentShot(ev.data); break;
+      case "action":       addLog(`[${ev.action.toUpperCase()}] ${ev.detail ?? ""}`, "action"); break;
+      case "captcha":
+        setCaptchaMsg(ev.message);
+        setInteractMode("captcha");
+        addLog("توقف — حل الكابتشا", "warn");
+        break;
+      case "captcha_solved":
+        setInteractMode("none"); setLiveShot(null);
+        addLog("تم — استمرار التنفيذ", "success");
+        break;
+      case "paused":
+        setStatus("paused");
+        setInteractMode("paused");
+        setRunning(true);
+        addLog("⏸ مؤقت — يمكنك التحكم الآن", "warn");
+        break;
+      case "resumed":
+        setStatus("running");
+        setInteractMode("none"); setLiveShot(null);
+        setRunning(true);
+        addLog("▶ استُؤنف التنفيذ", "success");
+        break;
+      case "done":
+        setStatus(ev.success ? "done" : "error");
+        setFinalMsg(ev.message);
+        addLog(ev.message, ev.success ? "success" : "error");
+        setRunning(false); setInteractMode("none");
+        clearSession();
+        break;
+      case "error":
+        setStatus("error"); setFinalMsg(ev.message);
+        addLog(ev.message, "error"); setRunning(false);
+        clearSession();
+        break;
+    }
+  }, [addLog]);
 
+  // ── Start agent ──────────────────────────────────────────────────────────
   const handleStart = async () => {
     if (!selectedAccountId) return;
     const acc = accounts.data?.find((a) => a.id === Number(selectedAccountId));
     if (!acc) return;
 
     setLogs([]); setAgentShot(null); setLiveShot(null);
-    setRunning(true); setStatus("running"); setFinalMsg("");
+    setRunning(true); setStatus("running"); setFinalMsg(""); setInteractMode("none");
     logId.current = 0;
 
     const task: object =
@@ -233,6 +343,7 @@ export default function Agent() {
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
+      let firstSessionId: string | null = null;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -242,7 +353,15 @@ export default function Agent() {
         for (const part of parts) {
           const line = part.trim();
           if (!line.startsWith("data:")) continue;
-          try { onEvent(JSON.parse(line.slice(5).trim()) as AgentEvent); } catch {}
+          try {
+            const ev = JSON.parse(line.slice(5).trim()) as AgentEvent;
+            handleEvent(ev);
+            // Save session to localStorage once we have the ID
+            if (ev.type === "session_id" && !firstSessionId) {
+              firstSessionId = ev.sessionId;
+              saveSession(ev.sessionId);
+            }
+          } catch {}
         }
       }
     } catch (err) {
@@ -252,45 +371,33 @@ export default function Agent() {
     }
   };
 
-  const onEvent = (ev: AgentEvent) => {
-    switch (ev.type) {
-      case "session_id":   setSessionId(ev.sessionId); sessionIdRef.current = ev.sessionId; addLog(`جلسة: ${ev.sessionId}`, "info"); break;
-      case "log":          addLog(ev.message, ev.level); break;
-      case "screenshot":   setAgentShot(ev.data); break;
-      case "action":       addLog(`[${ev.action.toUpperCase()}] ${ev.detail ?? ""}`, "action"); break;
-      case "captcha":
-        setCaptchaMsg(ev.message);
-        setCaptchaOpen(true);
-        addLog("توقف — حل الكابتشا", "warn");
-        break;
-      case "captcha_solved":
-        setCaptchaOpen(false); setLiveShot(null);
-        addLog("تم — استمرار التنفيذ", "success");
-        break;
-      case "done":
-        setStatus(ev.success ? "done" : "error");
-        setFinalMsg(ev.message);
-        addLog(ev.message, ev.success ? "success" : "error");
-        setRunning(false); setCaptchaOpen(false);
-        break;
-      case "error":
-        setStatus("error"); setFinalMsg(ev.message);
-        addLog(ev.message, "error"); setRunning(false);
-        break;
-    }
-  };
-
   const handleStop = async () => {
     abortRef.current?.abort();
     await fetch("/api/agent/stop", { method: "POST" }).catch(() => {});
-    setRunning(false); setStatus("idle"); setCaptchaOpen(false);
+    setRunning(false); setStatus("idle"); setInteractMode("none");
+    clearSession();
     addLog("أُوقف العميل", "warn");
   };
 
+  const handlePause = async () => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    addLog("⏸ طلب إيقاف مؤقت...", "info");
+    await fetch(`/api/agent/pause/${sid}`, { method: "POST" }).catch(() => {});
+  };
+
+  const handleResume = async () => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    await fetch(`/api/agent/resume/${sid}`, { method: "POST" }).catch(() => {});
+    setInteractMode("none"); setLiveShot(null);
+  };
+
   const handleCaptchaDone = async () => {
-    if (!sessionId) return;
-    await fetch(`/api/agent/captcha-solved/${sessionId}`, { method: "POST" }).catch(() => {});
-    setCaptchaOpen(false); setLiveShot(null);
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    await fetch(`/api/agent/captcha-solved/${sid}`, { method: "POST" }).catch(() => {});
+    setInteractMode("none"); setLiveShot(null);
     addLog("إشارة متابعة أُرسلت للعميل", "success");
   };
 
@@ -309,22 +416,38 @@ export default function Agent() {
     return "text-muted-foreground";
   };
 
-  const displayShot = captchaOpen ? (liveShot ?? agentShot) : agentShot;
+  const displayShot = interactMode !== "none" ? (liveShot ?? agentShot) : agentShot;
   const selectedAccount = accounts.data?.find((a) => a.id === Number(selectedAccountId));
+  const interactOpen = interactMode !== "none";
+  const isPaused = status === "paused";
+
+  // ── Shared Interactive Browser UI ─────────────────────────────────────────
+  const interactiveHeader = interactMode === "paused"
+    ? { color: "text-blue-400", badge: "أنت في التحكم", icon: <Pause className="h-4 w-4" />, borderColor: "border-blue-400/50" }
+    : { color: "text-yellow-400", badge: "انقر أو اسحب", icon: <AlertTriangle className="h-4 w-4" />, borderColor: "border-yellow-400/50" };
 
   return (
     <div className="space-y-6" dir="rtl">
+
+      {/* Reconnecting banner */}
+      {reconnecting && (
+        <div className="flex items-center gap-2 bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-3 text-blue-400 text-sm">
+          <WifiOff className="h-4 w-4 animate-pulse" />
+          <span>جاري إعادة الربط بالجلسة النشطة...</span>
+        </div>
+      )}
 
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">عميل الأتمتة الذكي</h1>
           <p className="text-sm text-muted-foreground mt-0.5">
-            ذكاء اصطناعي يتحكم بمتصفح حقيقي · تحكّم كامل بالماوس عند الحاجة
+            ذكاء اصطناعي يتحكم بمتصفح حقيقي · توقف وتدخّل في أي وقت
           </p>
         </div>
         <div className="flex items-center gap-2">
           {status === "running" && <Badge className="bg-blue-500/15 text-blue-400 border-blue-500/30 animate-pulse"><Cpu className="h-3 w-3 mr-1"/>يعمل</Badge>}
+          {status === "paused"  && <Badge className="bg-blue-400/15 text-blue-300 border-blue-400/30"><Pause className="h-3 w-3 mr-1"/>مؤقت</Badge>}
           {status === "done"    && <Badge className="bg-primary/15 text-primary border-primary/30"><CheckCircle className="h-3 w-3 mr-1"/>اكتمل</Badge>}
           {status === "error"   && <Badge className="bg-destructive/15 text-destructive border-destructive/30"><XCircle className="h-3 w-3 mr-1"/>فشل</Badge>}
         </div>
@@ -344,8 +467,8 @@ export default function Agent() {
 
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">الحساب</Label>
-              <Select value={selectedAccountId} onValueChange={setSelectedAccountId}>
-                <SelectTrigger className="bg-input border-border" data-testid="select-account">
+              <Select value={selectedAccountId} onValueChange={setSelectedAccountId} disabled={running}>
+                <SelectTrigger className="bg-input border-border">
                   <SelectValue placeholder="اختر حساباً..." />
                 </SelectTrigger>
                 <SelectContent className="bg-card border-border">
@@ -367,7 +490,7 @@ export default function Agent() {
 
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">نوع المهمة</Label>
-              <Select value={taskKind} onValueChange={(v) => setTaskKind(v as TaskKind)}>
+              <Select value={taskKind} onValueChange={(v) => setTaskKind(v as TaskKind)} disabled={running}>
                 <SelectTrigger className="bg-input border-border">
                   <SelectValue />
                 </SelectTrigger>
@@ -383,11 +506,11 @@ export default function Agent() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1.5">
                   <Label className="text-xs text-muted-foreground">اسم البوت</Label>
-                  <Input value={botName} onChange={(e) => setBotName(e.target.value)} className="bg-input border-border font-mono"/>
+                  <Input value={botName} onChange={(e) => setBotName(e.target.value)} disabled={running} className="bg-input border-border font-mono"/>
                 </div>
                 <div className="space-y-1.5">
                   <Label className="text-xs text-muted-foreground">البادئة</Label>
-                  <Input value={botPrefix} onChange={(e) => setBotPrefix(e.target.value)} className="bg-input border-border font-mono"/>
+                  <Input value={botPrefix} onChange={(e) => setBotPrefix(e.target.value)} disabled={running} className="bg-input border-border font-mono"/>
                 </div>
               </div>
             )}
@@ -395,7 +518,7 @@ export default function Agent() {
             {taskKind === "reset_token" && (
               <div className="space-y-1.5">
                 <Label className="text-xs text-muted-foreground">App ID</Label>
-                <Input value={appId} onChange={(e) => setAppId(e.target.value)} className="bg-input border-border font-mono" placeholder="1234567890123456789"/>
+                <Input value={appId} onChange={(e) => setAppId(e.target.value)} disabled={running} className="bg-input border-border font-mono" placeholder="1234567890123456789"/>
               </div>
             )}
 
@@ -405,11 +528,23 @@ export default function Agent() {
                   <Play className="h-4 w-4 mr-2"/>تشغيل العميل
                 </Button>
               ) : (
-                <Button onClick={handleStop} variant="destructive" className="flex-1 font-bold">
-                  <Square className="h-4 w-4 mr-2"/>إيقاف
-                </Button>
+                <>
+                  {/* Pause / Resume button */}
+                  {!isPaused ? (
+                    <Button onClick={handlePause} variant="outline" className="flex-1 border-blue-500/50 text-blue-400 hover:bg-blue-500/10 font-bold">
+                      <Pause className="h-4 w-4 mr-2"/>إيقاف مؤقت
+                    </Button>
+                  ) : (
+                    <Button onClick={handleResume} variant="outline" className="flex-1 border-primary/50 text-primary hover:bg-primary/10 font-bold">
+                      <PlayCircle className="h-4 w-4 mr-2"/>متابعة
+                    </Button>
+                  )}
+                  <Button onClick={handleStop} variant="destructive" className="font-bold">
+                    <Square className="h-4 w-4 mr-2"/>إيقاف
+                  </Button>
+                </>
               )}
-              <Button variant="outline" onClick={() => { setLogs([]); setAgentShot(null); setStatus("idle"); setFinalMsg(""); }} className="border-border hover:bg-secondary">
+              <Button variant="outline" onClick={() => { setLogs([]); setAgentShot(null); setStatus("idle"); setFinalMsg(""); }} disabled={running} className="border-border hover:bg-secondary">
                 <RefreshCw className="h-4 w-4"/>
               </Button>
             </div>
@@ -427,7 +562,8 @@ export default function Agent() {
           <CardHeader className="border-b border-border pb-4">
             <CardTitle className="text-sm font-semibold flex items-center gap-2">
               <Eye className="h-4 w-4 text-primary"/>نظرة المتصفح المباشرة
-              {running && <span className="mr-auto text-[10px] text-blue-400 font-mono animate-pulse">● LIVE</span>}
+              {running && !isPaused && <span className="mr-auto text-[10px] text-blue-400 font-mono animate-pulse">● LIVE</span>}
+              {isPaused && <span className="mr-auto text-[10px] text-blue-300 font-mono">⏸ مؤقت</span>}
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-4">
@@ -440,8 +576,8 @@ export default function Agent() {
                   draggable={false}
                 />
                 <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/75 rounded px-2 py-0.5">
-                  <div className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"/>
-                  <span className="text-[10px] font-mono text-primary">LIVE</span>
+                  <div className={`h-1.5 w-1.5 rounded-full ${isPaused ? "bg-blue-300" : "bg-primary animate-pulse"}`}/>
+                  <span className={`text-[10px] font-mono ${isPaused ? "text-blue-300" : "text-primary"}`}>{isPaused ? "PAUSED" : "LIVE"}</span>
                 </div>
               </div>
             ) : (
@@ -451,7 +587,7 @@ export default function Agent() {
               </div>
             )}
             <p className="text-[10px] text-muted-foreground mt-2 text-center font-mono">
-              سكرين شوت تلقائي · تحكّم كامل عند ظهور الكابتشا
+              سكرين شوت تلقائي · اضغط "إيقاف مؤقت" للتحكم الكامل بالمتصفح
             </p>
           </CardContent>
         </Card>
@@ -483,34 +619,41 @@ export default function Agent() {
       </Card>
 
       {/* ══════════════════════════════════════════════
-          CAPTCHA INTERACTIVE DIALOG
+          INTERACTIVE BROWSER DIALOG (captcha OR paused)
           ══════════════════════════════════════════════ */}
-      <Dialog open={captchaOpen} onOpenChange={() => {}}>
-        <DialogContent className="bg-card border-border max-w-3xl w-full p-0 gap-0" data-testid="dialog-captcha">
+      <Dialog open={interactOpen} onOpenChange={() => {}}>
+        <DialogContent className={`bg-card border-border max-w-3xl w-full p-0 gap-0`} data-testid="dialog-interact">
           <DialogHeader className="border-b border-border px-4 py-3">
-            <DialogTitle className="flex items-center gap-2 text-yellow-400 text-sm">
-              <AlertTriangle className="h-4 w-4"/>
-              تدخّل مطلوب
-              <Badge className="mr-auto bg-yellow-400/10 text-yellow-400 border-yellow-400/30 text-[10px]">
-                {isDragging ? "⠿ جاري السحب..." : "انقر أو اسحب على الصفحة"}
+            <DialogTitle className={`flex items-center gap-2 text-sm ${interactiveHeader.color}`}>
+              {interactiveHeader.icon}
+              {interactMode === "paused" ? "أنت في التحكم — تدخّل وحل المشكلة ثم اضغط متابعة" : "تدخّل مطلوب — حل الكابتشا"}
+              <Badge className={`mr-auto bg-current/10 border-current/30 text-[10px] ${interactiveHeader.color}`}>
+                {isDragging ? "⠿ جاري السحب..." : interactiveHeader.badge}
               </Badge>
             </DialogTitle>
           </DialogHeader>
 
           <div className="p-4 space-y-3">
-            <p className="text-xs text-center text-muted-foreground bg-secondary/30 border border-border rounded p-2">
-              {captchaMsg}
-            </p>
+            {interactMode === "captcha" && (
+              <p className="text-xs text-center text-muted-foreground bg-secondary/30 border border-border rounded p-2">
+                {captchaMsg}
+              </p>
+            )}
+            {interactMode === "paused" && (
+              <p className="text-xs text-center text-blue-400/80 bg-blue-500/5 border border-blue-500/20 rounded p-2">
+                العميل متوقف — تصرّف يدوياً في المتصفح ثم اضغط <strong>متابعة الأتمتة</strong> ليكمل هو من مكانك
+              </p>
+            )}
 
-            {/* ── LIVE INTERACTIVE IMAGE ── */}
+            {/* LIVE INTERACTIVE IMAGE */}
             <div
-              className={`relative rounded-md overflow-hidden border-2 bg-black select-none ${isDragging ? "border-blue-400/70" : "border-yellow-400/50"}`}
+              className={`relative rounded-md overflow-hidden border-2 bg-black select-none ${isDragging ? "border-blue-400/70" : interactiveHeader.borderColor}`}
               style={{ touchAction: "none" }}
             >
               {(liveShot ?? agentShot) ? (
                 <div className="relative">
                   <img
-                    ref={captchaImgRef}
+                    ref={interactImgRef}
                     src={`data:image/jpeg;base64,${liveShot ?? agentShot}`}
                     alt="Live browser"
                     className="w-full h-auto block"
@@ -522,60 +665,47 @@ export default function Agent() {
                     onPointerLeave={handlePointerLeave}
                   />
 
-                  {/* Custom cursor dot */}
                   {cursorPos && (
                     <div
                       className="absolute pointer-events-none rounded-full border-2 transition-none"
                       style={{
-                        left: cursorPos.x - 8,
-                        top: cursorPos.y - 8,
+                        left: cursorPos.x - 8, top: cursorPos.y - 8,
                         width: 16, height: 16,
-                        borderColor: isDragging ? "#60a5fa" : "#facc15",
+                        borderColor: isDragging ? "#60a5fa" : interactMode === "paused" ? "#60a5fa" : "#facc15",
                         boxShadow: isDragging ? "0 0 8px rgba(96,165,250,0.8)" : "0 0 8px rgba(250,204,21,0.7)",
                       }}
                     />
                   )}
 
-                  {/* Drag trail line (visual) */}
-                  {isDragging && dragStart && cursorPos && captchaImgRef.current && (
-                    <svg
-                      className="absolute inset-0 w-full h-full pointer-events-none"
-                      style={{ overflow: "visible" }}
-                    >
+                  {isDragging && dragStart && cursorPos && interactImgRef.current && (
+                    <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: "visible" }}>
                       <line
-                        x1={(dragStart.x / BW) * captchaImgRef.current.clientWidth}
-                        y1={(dragStart.y / BH) * captchaImgRef.current.clientHeight}
-                        x2={cursorPos.x}
-                        y2={cursorPos.y}
-                        stroke="#60a5fa"
-                        strokeWidth="2"
-                        strokeDasharray="4 2"
-                        opacity="0.7"
+                        x1={(dragStart.x / BW) * interactImgRef.current.clientWidth}
+                        y1={(dragStart.y / BH) * interactImgRef.current.clientHeight}
+                        x2={cursorPos.x} y2={cursorPos.y}
+                        stroke="#60a5fa" strokeWidth="2" strokeDasharray="4 2" opacity="0.7"
                       />
                     </svg>
                   )}
 
-                  {/* Busy overlay */}
                   {busy && !isDragging && (
                     <div className="absolute inset-0 bg-black/20 flex items-center justify-center pointer-events-none">
-                      <span className="text-yellow-400 text-xs font-mono animate-pulse">ينفذ...</span>
+                      <span className={`text-xs font-mono animate-pulse ${interactMode === "paused" ? "text-blue-400" : "text-yellow-400"}`}>ينفذ...</span>
                     </div>
                   )}
 
-                  {/* Status chip */}
                   <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/75 rounded px-2 py-0.5">
-                    <div className={`h-1.5 w-1.5 rounded-full animate-pulse ${isDragging ? "bg-blue-400" : "bg-yellow-400"}`}/>
-                    <span className={`text-[10px] font-mono ${isDragging ? "text-blue-400" : "text-yellow-400"}`}>
+                    <div className={`h-1.5 w-1.5 rounded-full animate-pulse ${interactMode === "paused" ? "bg-blue-400" : "bg-yellow-400"}`}/>
+                    <span className={`text-[10px] font-mono ${interactMode === "paused" ? "text-blue-400" : "text-yellow-400"}`}>
                       {isDragging ? "DRAG" : "LIVE"}
                     </span>
                   </div>
 
-                  {/* Coords */}
-                  {cursorPos && captchaImgRef.current && (
+                  {cursorPos && interactImgRef.current && (
                     <div className="absolute bottom-2 left-2 bg-black/75 rounded px-2 py-0.5 font-mono text-[10px] text-yellow-400">
-                      {Math.round((cursorPos.x / captchaImgRef.current.clientWidth) * BW)}
+                      {Math.round((cursorPos.x / interactImgRef.current.clientWidth) * BW)}
                       {" , "}
-                      {Math.round((cursorPos.y / captchaImgRef.current.clientHeight) * BH)}
+                      {Math.round((cursorPos.y / interactImgRef.current.clientHeight) * BH)}
                     </div>
                   )}
                 </div>
@@ -586,7 +716,6 @@ export default function Agent() {
               )}
             </div>
 
-            {/* Hint */}
             <p className="text-[10px] text-muted-foreground text-center font-mono">
               انقر للضغط · اضغط واسحب لتحريك السلايدر · الإحداثيات دقيقة 1:1 مع المتصفح
             </p>
@@ -634,11 +763,17 @@ export default function Agent() {
             </div>
 
             <div className="flex gap-3 pt-1">
-              <Button onClick={handleCaptchaDone} className="flex-1 bg-primary text-black font-bold hover:bg-primary/90">
-                <CheckCircle className="h-4 w-4 mr-2"/>تم — متابعة الأتمتة
-              </Button>
+              {interactMode === "captcha" ? (
+                <Button onClick={handleCaptchaDone} className="flex-1 bg-primary text-black font-bold hover:bg-primary/90">
+                  <CheckCircle className="h-4 w-4 mr-2"/>تم — متابعة الأتمتة
+                </Button>
+              ) : (
+                <Button onClick={handleResume} className="flex-1 bg-blue-500 text-white font-bold hover:bg-blue-600">
+                  <PlayCircle className="h-4 w-4 mr-2"/>متابعة الأتمتة
+                </Button>
+              )}
               <Button variant="destructive" onClick={handleStop} className="font-bold">
-                <Square className="h-4 w-4 mr-2"/>إيقاف
+                <Square className="h-4 w-4 mr-2"/>إيقاف نهائي
               </Button>
             </div>
           </div>
