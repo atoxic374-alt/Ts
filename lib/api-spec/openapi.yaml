@@ -1,22 +1,30 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Discord Automation Studio API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: accounts
+    description: Discord account management
+  - name: bots
+    description: Discord bot management
+  - name: sessions
+    description: Automation session management
+  - name: rules
+    description: Automation rules
+  - name: ai
+    description: AI assistant
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +32,357 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /accounts:
+    get:
+      operationId: listAccounts
+      tags: [accounts]
+      summary: List all saved accounts
+      responses:
+        "200":
+          description: List of accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+    post:
+      operationId: createAccount
+      tags: [accounts]
+      summary: Add a new Discord account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountBody"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+
+  /accounts/{id}:
+    get:
+      operationId: getAccount
+      tags: [accounts]
+      summary: Get a single account
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Account details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+    put:
+      operationId: updateAccount
+      tags: [accounts]
+      summary: Update an account
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountBody"
+      responses:
+        "200":
+          description: Account updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+    delete:
+      operationId: deleteAccount
+      tags: [accounts]
+      summary: Delete an account
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteResult"
+
+  /bots:
+    get:
+      operationId: listBots
+      tags: [bots]
+      summary: List all bots
+      responses:
+        "200":
+          description: List of bots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Bot"
+    post:
+      operationId: createBot
+      tags: [bots]
+      summary: Create a new bot record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBotBody"
+      responses:
+        "201":
+          description: Bot created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+
+  /bots/{id}:
+    get:
+      operationId: getBot
+      tags: [bots]
+      summary: Get a single bot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bot details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+    put:
+      operationId: updateBot
+      tags: [bots]
+      summary: Update a bot (e.g. reset token, rename)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBotBody"
+      responses:
+        "200":
+          description: Bot updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+    delete:
+      operationId: deleteBot
+      tags: [bots]
+      summary: Delete a bot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteResult"
+
+  /sessions:
+    get:
+      operationId: listSessions
+      tags: [sessions]
+      summary: List all automation sessions
+      responses:
+        "200":
+          description: Sessions list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Session"
+    post:
+      operationId: createSession
+      tags: [sessions]
+      summary: Start a new automation session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionBody"
+      responses:
+        "201":
+          description: Session started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+
+  /sessions/active:
+    get:
+      operationId: getActiveSession
+      tags: [sessions]
+      summary: Get the currently active session (if any)
+      responses:
+        "200":
+          description: Active session or null
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOrNull"
+
+  /sessions/{id}:
+    get:
+      operationId: getSession
+      tags: [sessions]
+      summary: Get a single session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+    put:
+      operationId: updateSession
+      tags: [sessions]
+      summary: Update session (progress, status, logs)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSessionBody"
+      responses:
+        "200":
+          description: Session updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+
+  /sessions/{id}/stop:
+    post:
+      operationId: stopSession
+      tags: [sessions]
+      summary: Stop an active session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Session stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+
+  /rules:
+    get:
+      operationId: getRules
+      tags: [rules]
+      summary: Get the current automation rules
+      responses:
+        "200":
+          description: Current rules
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationRules"
+    put:
+      operationId: updateRules
+      tags: [rules]
+      summary: Update automation rules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AutomationRules"
+      responses:
+        "200":
+          description: Rules updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationRules"
+
+  /ai/chat:
+    post:
+      operationId: aiChat
+      tags: [ai]
+      summary: Send a message to the AI assistant for automation guidance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiChatBody"
+      responses:
+        "200":
+          description: AI response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiChatResponse"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [accounts]
+      summary: Get dashboard stats (totals, active bots, session counts)
+      responses:
+        "200":
+          description: Stats summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+
 components:
   schemas:
     HealthStatus:
@@ -31,6 +390,188 @@ components:
       properties:
         status:
           type: string
-      required:
-        - status
+      required: [status]
 
+    Account:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        email:
+          type: string
+        password:
+          type: string
+        twofaSecret:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive, error]
+        createdAt:
+          type: string
+      required: [id, name, email, password, status, createdAt]
+
+    CreateAccountBody:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        password:
+          type: string
+        twofaSecret:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive, error]
+      required: [name, email, password]
+
+    Bot:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        name:
+          type: string
+        token:
+          type: string
+        prefix:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive, error]
+        createdAt:
+          type: string
+      required: [id, name, token, prefix, status, createdAt]
+
+    CreateBotBody:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        name:
+          type: string
+        token:
+          type: string
+        prefix:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive, error]
+      required: [name, token, prefix]
+
+    Session:
+      type: object
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+          enum: [running, waiting, stopped, completed, error]
+        total:
+          type: integer
+        progress:
+          type: integer
+        waitSeconds:
+          type: integer
+        logs:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required: [id, status, total, progress, waitSeconds, createdAt, updatedAt]
+
+    SessionOrNull:
+      type: object
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        exists:
+          type: boolean
+      required: [exists]
+
+    CreateSessionBody:
+      type: object
+      properties:
+        total:
+          type: integer
+        waitSeconds:
+          type: integer
+      required: [total, waitSeconds]
+
+    UpdateSessionBody:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [running, waiting, stopped, completed, error]
+        progress:
+          type: integer
+        logs:
+          type: string
+
+    AutomationRules:
+      type: object
+      properties:
+        createTeams:
+          type: boolean
+        createBots:
+          type: boolean
+        linkBots:
+          type: boolean
+        quantity:
+          type: integer
+        botPrefix:
+          type: string
+        waitMinutes:
+          type: integer
+      required: [createTeams, createBots, linkBots, quantity, botPrefix, waitMinutes]
+
+    AiChatBody:
+      type: object
+      properties:
+        message:
+          type: string
+        context:
+          type: string
+      required: [message]
+
+    AiChatResponse:
+      type: object
+      properties:
+        reply:
+          type: string
+        suggestions:
+          type: array
+          items:
+            type: string
+      required: [reply]
+
+    Stats:
+      type: object
+      properties:
+        totalAccounts:
+          type: integer
+        activeAccounts:
+          type: integer
+        totalBots:
+          type: integer
+        activeBots:
+          type: integer
+        totalSessions:
+          type: integer
+        lastSessionStatus:
+          type: string
+      required: [totalAccounts, activeAccounts, totalBots, activeBots, totalSessions]
+
+    DeleteResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+      required: [success]
