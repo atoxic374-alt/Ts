@@ -472,75 +472,167 @@ async function clickDiscordCheckbox(page: Page): Promise<boolean> {
   return false;
 }
 
-// ── Smart click with 6-strategy fallback ─────────────────────────────────────
+// ── Click element by visible text content (most reliable for Discord UI) ──────
+async function clickByText(page: Page, text: string, x?: number, y?: number): Promise<boolean> {
+  const t = text.trim();
+
+  // Strategy A: Playwright getByText — picks nearest to provided coords
+  try {
+    const loc = page.getByText(t, { exact: false });
+    const count = await loc.count();
+    if (count > 0) {
+      if (count > 1 && x !== undefined && y !== undefined) {
+        let best = 0, minDist = Infinity;
+        for (let i = 0; i < count; i++) {
+          const box = await loc.nth(i).boundingBox();
+          if (box) {
+            const d = Math.hypot(box.x + box.width / 2 - x, box.y + box.height / 2 - y);
+            if (d < minDist) { minDist = d; best = i; }
+          }
+        }
+        await loc.nth(best).click({ timeout: 3000 });
+      } else {
+        await loc.first().click({ timeout: 3000 });
+      }
+      await page.waitForTimeout(200);
+      return true;
+    }
+  } catch {}
+
+  // Strategy B: getByRole button
+  try {
+    const loc = page.getByRole("button", { name: t, exact: false });
+    if (await loc.count() > 0) { await loc.first().click({ timeout: 3000 }); await page.waitForTimeout(200); return true; }
+  } catch {}
+
+  // Strategy C: getByRole link
+  try {
+    const loc = page.getByRole("link", { name: t, exact: false });
+    if (await loc.count() > 0) { await loc.first().click({ timeout: 3000 }); await page.waitForTimeout(200); return true; }
+  } catch {}
+
+  // Strategy D: full DOM scan — find clickable with matching text, pick closest to coords
+  try {
+    const pos = await page.evaluate(({ txt, px, py }: { txt: string; px: number; py: number }) => {
+      const candidates = document.querySelectorAll(
+        'button, a, [role="button"], [role="link"], [role="menuitem"], [role="option"], [class*="btn"], [class*="Btn"], div[tabindex], span[tabindex]'
+      );
+      let best: { x: number; y: number } | null = null;
+      let bestScore = Infinity;
+      for (const el of candidates) {
+        const elTxt = (el as HTMLElement).innerText?.trim().toLowerCase() ?? "";
+        if (!elTxt.includes(txt.toLowerCase())) continue;
+        (el as HTMLElement).scrollIntoView({ behavior: "instant", block: "center" });
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        const dist = px >= 0 ? Math.hypot(cx - px, cy - py) : 0;
+        if (dist < bestScore) { bestScore = dist; best = { x: Math.round(cx), y: Math.round(cy) }; }
+      }
+      return best;
+    }, { txt: t, px: x ?? -1, py: y ?? -1 });
+
+    if (pos) {
+      await page.mouse.move(pos.x, pos.y);
+      await page.waitForTimeout(60);
+      await page.mouse.click(pos.x, pos.y);
+      await page.waitForTimeout(200);
+      return true;
+    }
+  } catch {}
+
+  return false;
+}
+
+// ── Extract text from a selector that embeds text patterns ───────────────────
+function extractTextFromSelector(selector: string): string | null {
+  const m =
+    selector.match(/:text\("([^"]+)"\)/) ||
+    selector.match(/:text\('([^']+)'\)/) ||
+    selector.match(/text="([^"]+)"/) ||
+    selector.match(/text='([^']+)'/) ||
+    selector.match(/:has-text\("([^"]+)"\)/) ||
+    selector.match(/:has-text\('([^']+)'\)/);
+  return m ? m[1] : null;
+}
+
+// ── Smart click: coordinate-first when available, then text, then selector ────
 async function smartClick(page: Page, selector: string, x?: number, y?: number): Promise<void> {
-  // Special case: checkbox — use dedicated handler first
+  // Special case: checkbox — dedicated handler
   if (selector.includes("checkbox")) {
     const handled = await clickDiscordCheckbox(page);
     if (handled) return;
+    if (x !== undefined && y !== undefined) { await humanClick(page, x, y); return; }
   }
 
-  // 0. Scroll element into view (critical for off-screen elements)
+  // ── PRIORITY 1: Coordinate click — trust the AI's eyes first ─────────────
+  // When AI provides x,y from the screenshot, it SAW the element there.
+  // Click those coordinates immediately without wasting time on selector guessing.
+  if (x !== undefined && y !== undefined) {
+    try {
+      await page.mouse.move(x, y);
+      await page.waitForTimeout(60);
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(250);
+      return;
+    } catch {}
+  }
+
+  // ── PRIORITY 2: Text-based click ─────────────────────────────────────────
+  // If selector contains text patterns, or looks like a label, find it by text
+  const embeddedText = extractTextFromSelector(selector);
+  if (embeddedText) {
+    const done = await clickByText(page, embeddedText, x, y);
+    if (done) return;
+  }
+
+  // ── PRIORITY 3: Scroll into view then normal Playwright locator ───────────
   try {
     await page.evaluate((sel) => {
       const el = document.querySelector(sel);
-      if (el) el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+      if (el) el.scrollIntoView({ behavior: "instant", block: "center" });
     }, selector);
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(120);
   } catch {}
 
-  // 1. Wait for visible then normal click
   try {
-    await page.locator(selector).first().waitFor({ state: "visible", timeout: 2000 });
-    await page.locator(selector).first().click({ timeout: 3000 });
+    await page.locator(selector).first().waitFor({ state: "visible", timeout: 1500 });
+    await page.locator(selector).first().click({ timeout: 2500 });
     return;
   } catch {}
 
-  // 2. Force click (ignores visibility/interactability checks)
-  try { await page.locator(selector).first().click({ force: true, timeout: 3000 }); return; } catch {}
+  // Force click
+  try { await page.locator(selector).first().click({ force: true, timeout: 2000 }); return; } catch {}
 
-  // 3. JS click via MouseEvent dispatch (most reliable for hidden/custom elements)
+  // ── PRIORITY 4: JS MouseEvent dispatch ───────────────────────────────────
   try {
     const clicked = await page.evaluate((sel) => {
       const el = document.querySelector(sel) as HTMLElement | null;
       if (!el) return false;
       el.scrollIntoView({ behavior: "instant", block: "center" });
-      const rect = el.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      ["mouseover", "mouseenter", "mousemove"].forEach((evt) =>
-        el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, clientX: cx, clientY: cy }))
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      ["mouseover", "mouseenter", "mousedown", "mouseup", "click"].forEach((e) =>
+        el.dispatchEvent(new MouseEvent(e, { bubbles: true, cancelable: true, clientX: cx, clientY: cy }))
       );
-      el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
-      el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
-      el.dispatchEvent(new MouseEvent("click",     { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
       return true;
     }, selector);
-    if (clicked) { await page.waitForTimeout(250); return; }
+    if (clicked) { await page.waitForTimeout(200); return; }
   } catch {}
 
-  // 4. getBoundingClientRect → page.mouse.click at actual position
+  // ── PRIORITY 5: getBoundingClientRect → mouse.click ──────────────────────
   try {
-    const coords = await page.evaluate((sel) => {
+    const pos = await page.evaluate((sel) => {
       const el = document.querySelector(sel);
       if (!el) return null;
       el.scrollIntoView({ behavior: "instant", block: "center" });
       const r = el.getBoundingClientRect();
+      if (r.width === 0) return null;
       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
     }, selector);
-    if (coords && coords.x > 0 && coords.y > 0) {
-      await page.mouse.move(coords.x, coords.y);
-      await page.waitForTimeout(80);
-      await page.mouse.click(coords.x, coords.y);
-      await page.waitForTimeout(200);
-      return;
-    }
+    if (pos) { await page.mouse.click(pos.x, pos.y); await page.waitForTimeout(200); return; }
   } catch {}
-
-  // 5. Coordinate-based human click (from AI-provided coords)
-  if (x !== undefined && y !== undefined) {
-    await humanClick(page, x, y); return;
-  }
 
   throw new Error(`لم يُعثر على العنصر: ${selector}`);
 }
@@ -576,47 +668,65 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
       }
       break;
 
-    case "click":
-      if (action.selector) {
-        onEvent({ type: "log", message: `نقر: ${action.selector}`, level: "info" });
-        await smartClick(page, action.selector, action.x, action.y);
-      } else if (action.x !== undefined && action.y !== undefined) {
+    case "click": {
+      const hasCoords = action.x !== undefined && action.y !== undefined;
+      const hasSelector = !!action.selector;
+
+      if (hasCoords && !hasSelector) {
+        // Pure coordinate click — fastest path
         onEvent({ type: "log", message: `نقر إحداثيات: (${action.x}, ${action.y})`, level: "info" });
-        await humanClick(page, action.x, action.y);
+        await humanClick(page, action.x!, action.y!);
+      } else if (hasSelector) {
+        onEvent({ type: "log", message: `نقر: ${action.selector}${hasCoords ? ` @ (${action.x},${action.y})` : ""}`, level: "info" });
+        // If message contains text hint, try clickByText first as extra help
+        const msgText = action.message?.trim();
+        if (msgText && msgText.length < 60 && !msgText.includes("http")) {
+          const byText = await clickByText(page, msgText, action.x, action.y).catch(() => false);
+          if (byText) break;
+        }
+        await smartClick(page, action.selector!, action.x, action.y);
       }
       break;
+    }
 
-    case "js_click":
+    case "js_click": {
       if (action.selector) {
-        onEvent({ type: "log", message: `JS نقر: ${action.selector}`, level: "info" });
-        // Special path for checkboxes — use dedicated multi-strategy handler
+        onEvent({ type: "log", message: `JS نقر: ${action.selector}${action.x !== undefined ? ` @ (${action.x},${action.y})` : ""}`, level: "info" });
+
+        // Checkbox — dedicated handler
         if (action.selector.includes("checkbox")) {
           const handled = await clickDiscordCheckbox(page);
           if (handled) {
             onEvent({ type: "log", message: `✓ تم الضغط على الـ checkbox`, level: "success" });
           } else if (action.x !== undefined && action.y !== undefined) {
-            onEvent({ type: "log", message: `checkbox: جرب الإحداثيات`, level: "warn" });
             await humanClick(page, action.x, action.y);
-          } else {
-            onEvent({ type: "log", message: `checkbox: تعذّر — جرب الإحداثيات في الخطوة التالية`, level: "warn" });
           }
           break;
         }
-        // Normal JS click for non-checkbox elements
+
+        // Coordinates first
+        if (action.x !== undefined && action.y !== undefined) {
+          await page.mouse.click(action.x, action.y);
+          await page.waitForTimeout(200);
+          break;
+        }
+
+        // JS evaluate click
         const clicked = await page.evaluate((sel) => {
           const el = document.querySelector(sel) as HTMLElement | null;
-          if (el) { el.click(); return true; }
+          if (el) { el.scrollIntoView({ behavior: "instant", block: "center" }); el.click(); return true; }
           return false;
         }, action.selector);
-        if (!clicked && action.x !== undefined && action.y !== undefined) {
-          await humanClick(page, action.x, action.y);
-        } else if (!clicked) {
-          onEvent({ type: "log", message: `js_click: العنصر غير موجود`, level: "warn" });
+        if (!clicked) {
+          // Try by text if we have message
+          const msgText = action.message?.trim();
+          if (msgText) await clickByText(page, msgText, action.x, action.y);
         }
       } else if (action.x !== undefined && action.y !== undefined) {
         await humanClick(page, action.x, action.y);
       }
       break;
+    }
 
     case "type":
       if (action.selector && action.text !== undefined) {
@@ -654,43 +764,48 @@ async function executeAction(page: Page, action: GeminiAction, onEvent: (e: Agen
 function buildSystemPrompt(task: AgentTask, hasSession: boolean): string {
   const base = `أنت مساعد أتمتة ديسكورد محترف. تتحكم بمتصفح حقيقي لإنجاز مهام على ديسكورد وDiscord Developer Portal.
 
-السكرين شوت المُرسل إليك حديث جداً ويعكس الحالة الفعلية للمتصفح الآن. لا تفترض أي شيء خارج ما تراه.
+السكرين شوت المُرسل دقيق ويعكس الحالة الفعلية الآن. انظر إليه بعناية شديدة قبل كل قرار.
 
-أجب بـ JSON فقط:
+أجب بـ JSON فقط (لا نص خارج JSON):
 {
   "action": "navigate"|"click"|"type"|"wait"|"done"|"captcha"|"scroll"|"press_key"|"hover"|"js_click",
-  "selector": "CSS selector",
-  "text": "النص",
+  "selector": "CSS selector أو نص",
+  "text": "النص للكتابة",
   "url": "الرابط",
   "key": "المفتاح",
-  "x": رقم_اختياري,
-  "y": رقم_اختياري,
-  "message": "رسالة",
+  "x": رقم_إلزامي_للنقر,
+  "y": رقم_إلزامي_للنقر,
+  "message": "نص الزر أو العنصر المراد الضغط عليه",
   "done_message": "رسالة النهاية",
   "success": true|false
 }
 
-قواعد الـ selectors (مهمة جداً):
-• انظر للسكرين شوت قبل اختيار أي selector — فقط استخدم عناصر تراها فعلاً
-• للأزرار: button[type="submit"] أو :text("نص الزر") أو role=button[name="نص"]
-• للـ inputs: input[type="email"] أو input[name="email"]
-• للـ checkboxes: استخدم action "js_click" مع selector "input[type=checkbox]"
-  ← النظام سيجرب تلقائياً: الـ label، الـ div المجاور، وإجبار الـ input
-• أضف x,y من موقع العنصر في الصورة دائماً كاحتياطي
+══════ قاعدة النقر الأهم ══════
+عند أي action:"click" أو "js_click":
+• x و y إلزاميان دائماً — انظر للسكرين شوت وحدد الإحداثيات الدقيقة للعنصر
+• النظام سيضغط الإحداثيات أولاً فوراً (أسرع وأدق من الـ selector)
+• ضع نص الزر/العنصر في حقل "message" (مثال: "message": "New Application")
+• إذا كانت الصورة 1280×800، الإحداثيات هي الموضع الفعلي بالبيكسل
 
-قواعد Checkbox ديسكورد (مهم جداً):
-• Discord Developer Portal يخفي الـ checkbox بـ CSS — الشكل المرئي هو div أو svg
-• الحل الصحيح: action:"js_click" + selector:"input[type=checkbox]"
-• إذا لم يتغير شيء: حدد الـ x,y من موقع المربع في السكرين شوت واستخدم action:"click"
-• لا تستخدم page.click مع timeout طويل على الـ checkbox — سيفشل دائماً
+مثال صحيح للضغط على زر "New Application" في أعلى اليمين:
+{"action":"click","selector":"button","message":"New Application","x":543,"y":52}
 
-قواعد عامة:
-• إذا السجل يقول "لا تغيير" مرتين — جرّب selector مختلف أو إحداثيات
+══════ قواعد المحددات (selector) ══════
+• input[type="email"] — حقل البريد
+• input[type="password"] — حقل الباسوورد  
+• button[type="submit"] — زر إرسال
+• للـ checkboxes: action:"js_click" + selector:"input[type=checkbox]" + x,y من موقعه
+
+══════ قواعد Checkbox ديسكورد ══════
+• Discord يخفي الـ checkbox — الشكل المرئي div أو svg
+• الحل: action:"js_click" + selector:"input[type=checkbox]" + x,y إلزامي
+
+══════ قواعد عامة ══════
+• السجل "لا تغيير" مرتين → جرّب x,y مختلفة أو selector مختلف
 • CAPTCHA/hCaptcha → action:"captcha" فوراً
-• تحقق بريد إلكتروني → action:"captcha" مع شرح
-• عند الإتمام → done:true | عند فشل مؤكد → done:false
-• خطوة واحدة فقط في كل رد
-• لا تكرر نفس الـ action بنفس الـ selector إذا فشل مرتين`;
+• تحقق بريد إلكتروني → action:"captcha"
+• الإتمام → done:true | فشل مؤكد → done:false
+• خطوة واحدة فقط في كل رد`;
 
   if (task.kind === "login") {
     return `${base}
