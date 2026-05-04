@@ -42,25 +42,73 @@ export async function getSessionScreenshot(sessionId: string): Promise<string | 
   }
 }
 
+/** Move mouse along a bezier-curve path then click — looks human to CAPTCHA systems */
+async function humanClick(page: Page, targetX: number, targetY: number) {
+  // Current position (start from somewhere plausible on the page)
+  const startX = Math.round(Math.random() * 400 + 200);
+  const startY = Math.round(Math.random() * 200 + 200);
+
+  // Two bezier control points with slight randomness
+  const cp1x = startX + (targetX - startX) * 0.25 + (Math.random() - 0.5) * 80;
+  const cp1y = startY + (targetY - startY) * 0.25 + (Math.random() - 0.5) * 80;
+  const cp2x = startX + (targetX - startX) * 0.75 + (Math.random() - 0.5) * 60;
+  const cp2y = startY + (targetY - startY) * 0.75 + (Math.random() - 0.5) * 60;
+
+  const steps = 18 + Math.floor(Math.random() * 10); // 18–27 steps
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const mt = 1 - t;
+    // Cubic bezier formula
+    const x = Math.round(mt * mt * mt * startX + 3 * mt * mt * t * cp1x + 3 * mt * t * t * cp2x + t * t * t * targetX);
+    const y = Math.round(mt * mt * mt * startY + 3 * mt * mt * t * cp1y + 3 * mt * t * t * cp2y + t * t * t * targetY);
+    await page.mouse.move(x, y);
+    // Variable delay — faster in the middle, slower near ends
+    const delay = i === 0 || i === steps ? 18 + Math.random() * 15 : 6 + Math.random() * 8;
+    await new Promise((r) => setTimeout(r, delay));
+  }
+
+  // Small jitter right before click (like real hand tremor)
+  const jx = targetX + Math.round((Math.random() - 0.5) * 3);
+  const jy = targetY + Math.round((Math.random() - 0.5) * 3);
+  await page.mouse.move(jx, jy);
+  await new Promise((r) => setTimeout(r, 30 + Math.random() * 40));
+
+  // Press then release (don't use .click() shortcut — more natural)
+  await page.mouse.down();
+  await new Promise((r) => setTimeout(r, 60 + Math.random() * 80));
+  await page.mouse.up();
+}
+
 export async function interactWithSession(
   sessionId: string,
-  action: { type: "click"; x: number; y: number } | { type: "type"; text: string } | { type: "key"; key: string } | { type: "scroll"; deltaY: number }
-): Promise<boolean> {
+  action:
+    | { type: "click"; x: number; y: number }
+    | { type: "type"; text: string }
+    | { type: "key"; key: string }
+    | { type: "scroll"; deltaY: number }
+): Promise<{ ok: boolean; screenshotAfter?: string }> {
   const page = activePages.get(sessionId);
-  if (!page) return false;
+  if (!page) return { ok: false };
   try {
     if (action.type === "click") {
-      await page.mouse.click(action.x, action.y);
+      await humanClick(page, action.x, action.y);
     } else if (action.type === "type") {
-      await page.keyboard.type(action.text, { delay: 40 });
+      // Realistic typing speed with variation
+      for (const char of action.text) {
+        await page.keyboard.type(char);
+        await new Promise((r) => setTimeout(r, 40 + Math.random() * 60));
+      }
     } else if (action.type === "key") {
       await page.keyboard.press(action.key);
     } else if (action.type === "scroll") {
       await page.mouse.wheel(0, action.deltaY);
     }
-    return true;
+    // Wait a little then grab fresh screenshot
+    await new Promise((r) => setTimeout(r, 350));
+    const buf = await page.screenshot({ type: "jpeg", quality: 70, fullPage: false });
+    return { ok: true, screenshotAfter: buf.toString("base64") };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 

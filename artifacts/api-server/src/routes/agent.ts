@@ -77,8 +77,9 @@ router.post("/agent/interact/:sessionId", async (req, res) => {
     res.status(400).json({ error: "action مطلوب" });
     return;
   }
-  const ok = await interactWithSession(sessionId, action);
-  res.json({ success: ok });
+  const result = await interactWithSession(sessionId, action);
+  // Return the fresh screenshot inline so the client doesn't need a second request
+  res.json({ success: result.ok, screenshot: result.screenshotAfter ?? null });
 });
 
 // ── Mark captcha as solved → unblock agent ───────────────────────────────────
