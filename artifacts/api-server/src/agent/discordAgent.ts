@@ -82,30 +82,48 @@ async function humanClick(page: Page, targetX: number, targetY: number) {
 export async function interactWithSession(
   sessionId: string,
   action:
-    | { type: "click"; x: number; y: number }
-    | { type: "type"; text: string }
-    | { type: "key"; key: string }
-    | { type: "scroll"; deltaY: number }
+    | { type: "click";    x: number; y: number }
+    | { type: "mousedown"; x: number; y: number }
+    | { type: "mousemove"; x: number; y: number }
+    | { type: "mouseup";   x: number; y: number }
+    | { type: "type";     text: string }
+    | { type: "key";      key: string }
+    | { type: "scroll";   deltaY: number }
 ): Promise<{ ok: boolean; screenshotAfter?: string }> {
   const page = activePages.get(sessionId);
   if (!page) return { ok: false };
   try {
     if (action.type === "click") {
-      await humanClick(page, action.x, action.y);
+      // Direct precise click — no bezier for manual interaction
+      await page.mouse.move(action.x, action.y);
+      await new Promise((r) => setTimeout(r, 30 + Math.random() * 30));
+      await page.mouse.down();
+      await new Promise((r) => setTimeout(r, 50 + Math.random() * 60));
+      await page.mouse.up();
+    } else if (action.type === "mousedown") {
+      await page.mouse.move(action.x, action.y);
+      await page.mouse.down();
+    } else if (action.type === "mousemove") {
+      await page.mouse.move(action.x, action.y);
+    } else if (action.type === "mouseup") {
+      await page.mouse.move(action.x, action.y);
+      await page.mouse.up();
     } else if (action.type === "type") {
-      // Realistic typing speed with variation
       for (const char of action.text) {
         await page.keyboard.type(char);
-        await new Promise((r) => setTimeout(r, 40 + Math.random() * 60));
+        await new Promise((r) => setTimeout(r, 35 + Math.random() * 55));
       }
     } else if (action.type === "key") {
       await page.keyboard.press(action.key);
     } else if (action.type === "scroll") {
       await page.mouse.wheel(0, action.deltaY);
     }
-    // Wait a little then grab fresh screenshot
-    await new Promise((r) => setTimeout(r, 350));
-    const buf = await page.screenshot({ type: "jpeg", quality: 70, fullPage: false });
+
+    // mousemove doesn't need a screenshot (too frequent — caller decides)
+    if (action.type === "mousemove") return { ok: true };
+
+    await new Promise((r) => setTimeout(r, 300));
+    const buf = await page.screenshot({ type: "jpeg", quality: 72, fullPage: false });
     return { ok: true, screenshotAfter: buf.toString("base64") };
   } catch {
     return { ok: false };
