@@ -289,6 +289,33 @@ export async function runDiscordAgent(
         } catch {}
       }
 
+      // ── 3b. Auto-detect "Missing Access" / Discord error pages ──────────────
+      try {
+        const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) ?? "");
+        const missingAccess =
+          pageText.includes("Missing Access") ||
+          pageText.includes("50001") ||
+          pageText.includes("missing access");
+
+        if (missingAccess && currentUrl.includes("discord.com/developers")) {
+          sessionCache.delete(task.email); // invalidate stale session
+          onEvent({
+            type: "log",
+            message: "⛔ Missing Access (50001) — الحساب لا يملك صلاحية Developer Portal. تحقق من: (1) الهاتف مرتبط بالحساب، (2) الحساب ليس جديداً، (3) لم تتجاوز حد التطبيقات",
+            level: "error",
+          });
+          onEvent({
+            type: "captcha",
+            message: "⛔ Missing Access — Discord يرفض الوصول لهذا الحساب.\n\nالأسباب الشائعة:\n• الحساب جديد (أقل من أسبوع)\n• لا يوجد هاتف مرتبط بالحساب\n• تجاوزت حد 25 تطبيق على الحساب\n• الحساب محظور من Developer Portal\n\nيمكنك تسجيل الدخول يدوياً والتحقق، أو اضغط إيقاف.",
+          });
+          await captchaResolver();
+          onEvent({ type: "captcha_solved" });
+          lastHash = 0;
+          consecutiveNoChange = 0;
+          continue;
+        }
+      } catch {}
+
       // ── 4. Build rich history context ─────────────────────────────────────
       const pageChangedFromLast = lastHash !== 0 && currentHash !== lastHash;
       lastHash = currentHash;
@@ -839,14 +866,18 @@ ${hasSession ? "⚡ جلسة محفوظة — تخطى تسجيل الدخول" 
 
 الخطوات:
 ${step1}
-• اضغط "New Application" (الزر الأزرق اليمين العلوي)
+• اضغط "New Application" — الزر الأزرق في أعلى يمين الصفحة. أعطِ x,y من موقعه في الصورة
 • في حقل Name: اكتب "${task.botName}"
-• للـ Checkbox في نموذج الإنشاء: استخدم js_click مع selector "input[type=checkbox]"
+• للـ Checkbox (الموافقة على الشروط): js_click + selector:"input[type=checkbox]" + x,y من موقعه
 • اضغط "Create"
 • بعد الإنشاء: اذهب لـ "Bot" من القائمة اليسرى
-• اضغط "Add Bot" أو "Reset Token"
-• وافق على التأكيدات
-• انسخ التوكن → done:true مع التوكن في done_message`;
+• اضغط "Reset Token" ثم وافق
+• انسخ التوكن → done:true مع التوكن في done_message
+
+تحذيرات:
+• إذا رأيت "Missing Access" أو "50001" → action:"captcha" مع شرح المشكلة
+• إذا طُلب تحقق إضافي → action:"captcha"
+• إذا رأيت نافذة "Add Bot" بدل "Reset Token" → اضغطها أيضاً`;
   }
 
   if (task.kind === "reset_token") {
